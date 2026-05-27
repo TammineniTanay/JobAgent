@@ -1,0 +1,12 @@
+﻿job_agent.db
+job_agent.db.corrupted
+daily_jobs.xlsx
+output/
+tracker.html
+*.pdf
+*.tex
+*.aux
+*.log
+__pycache__/
+*.pyc
+.env
