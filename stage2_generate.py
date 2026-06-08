@@ -1,6 +1,8 @@
 """
 stage2_generate.py
-One LLM call per job. Python builds all LaTeX.
+Generates resumes + cover letters for:
+- TO_PROCESS jobs  → full pipeline, then auto-apply
+- MANUAL_APPLY jobs (LinkedIn) → resume generated, status stays MANUAL_APPLY
 Output organized in date-based subfolders: output/YYYY-MM-DD/company_role/
 """
 
@@ -17,9 +19,8 @@ from datetime import datetime
 OLLAMA_URL   = "http://localhost:11434/api/generate"
 MODEL_NAME   = "llama3.1:8b"
 OUTPUT_DIR   = "output"
-JOB_COOLDOWN = 10   # seconds between Ollama calls
+JOB_COOLDOWN = 10
 
-# today's date folder — all jobs from this run go here
 TODAY_DIR = os.path.join(OUTPUT_DIR, datetime.now().strftime("%Y-%m-%d"))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -58,21 +59,22 @@ def clean_text(text):
 
 def detect_ats_name(url):
     u = url.lower()
-    if "greenhouse.io" in u or "gh_jid" in u:       return "Greenhouse (auto-apply ready)"
-    if "lever.co" in u or "jobs.lever" in u:         return "Lever (auto-apply ready)"
-    if "workday" in u or "myworkdayjobs" in u:       return "Workday (manual apply)"
-    if "oraclecloud" in u or "fa.em" in u:           return "Oracle (manual apply)"
-    if "taleo" in u:                                 return "Taleo (manual apply)"
-    if "icims" in u:                                 return "iCIMS (manual apply)"
-    if "smartrecruiters" in u:                       return "SmartRecruiters (manual apply)"
-    if "paylocity" in u:                             return "Paylocity (manual apply)"
-    if "adp" in u:                                   return "ADP (manual apply)"
-    if "google.com/about/careers" in u:              return "Google Careers (manual apply)"
-    if "apple.com" in u:                             return "Apple Jobs (manual apply)"
-    if "workable" in u:                              return "Workable (manual apply)"
-    if "rippling" in u:                              return "Rippling (manual apply)"
-    if "ultipro" in u:                               return "UltiPro (manual apply)"
-    return "Unknown ATS (manual apply)"
+    if "greenhouse.io" in u or "gh_jid" in u:       return "Greenhouse"
+    if "lever.co" in u or "jobs.lever" in u:         return "Lever"
+    if "workday" in u or "myworkdayjobs" in u:       return "Workday"
+    if "oraclecloud" in u or "fa.em" in u:           return "Oracle"
+    if "taleo" in u:                                 return "Taleo"
+    if "icims" in u:                                 return "iCIMS"
+    if "smartrecruiters" in u:                       return "SmartRecruiters"
+    if "paylocity" in u:                             return "Paylocity"
+    if "adp" in u:                                   return "ADP"
+    if "linkedin.com" in u:                          return "LinkedIn (manual)"
+    if "google.com/about/careers" in u:              return "Google (manual)"
+    if "apple.com" in u:                             return "Apple (manual)"
+    if "workable" in u:                              return "Workable"
+    if "rippling" in u:                              return "Rippling"
+    if "ultipro" in u:                               return "UltiPro"
+    return "Unknown"
 
 def write_job_info(outdir, company, title, url, verdict, reason):
     with open(os.path.join(outdir, "job_info.txt"), "w", encoding="utf-8") as f:
@@ -89,13 +91,13 @@ def write_job_info(outdir, company, title, url, verdict, reason):
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROJECT_OVERRIDES = [
-    (r"computer vision|object detection|image recognit|yolo|opencv|cv model",  "P3"),
-    (r"retrieval|vector search|rag|semantic search|embedding",                   "P2"),
-    (r"fine.tun|model training|qlora|deepspeed|llm training|lora",              "P1"),
-    (r"etl|data pipeline|pyspark|databricks|data engineer",                      "P5"),
-    (r"audio|speech|websocket|real.time stream|ffmpeg|whisper",                  "P4"),
-    (r"langchain|langgraph|agentic|agent framework|tool.calling",                "P2"),
-    (r"generative ai|llm|large language|gpt|chatbot|copilot",                   "P1"),
+    (r"computer vision|object detection|image recognit|yolo|opencv",  "P3"),
+    (r"retrieval|vector search|rag|semantic search|embedding",         "P2"),
+    (r"fine.tun|model training|qlora|deepspeed|llm training|lora",    "P1"),
+    (r"etl|data pipeline|pyspark|databricks|data engineer",            "P5"),
+    (r"audio|speech|websocket|real.time stream|ffmpeg|whisper",        "P4"),
+    (r"langchain|langgraph|agentic|agent framework",                   "P2"),
+    (r"generative ai|llm|large language|gpt|chatbot|copilot",         "P1"),
 ]
 
 DEFAULT_PROJECT_ORDER = ["P1", "P2", "P3", "P4", "P5"]
@@ -134,14 +136,14 @@ COMBINED_PROMPT = """You are a job application assistant for Tanay Tammineni. Ou
   "cl_para4": "Exactly 2 sentences. Request interview. Second sentence verbatim: I am authorized to work in the U.S."
 }
 
-PROJECT SELECTION — choose exactly 3:
+PROJECT SELECTION:
   P1 = Distributed LLM Fine-Tuning Pipeline  (ML/LLM/training/research)
   P2 = Production RAG System                  (RAG/search/NLP/GenAI/LangChain)
   P3 = Real-Time Vehicle Detection            (CV/vision or variety)
   P4 = LiveWire AI Extension                  (backend/systems/audio/API)
   P5 = Earthquake ML Pipeline                 (data engineering/PySpark/GCP/ETL)
 
-SKILLS — only from this list, never invent:
+SKILLS — only from this list:
   Python, SQL, Java, R, PyTorch, TensorFlow, Scikit-learn, XGBoost,
   LangChain, LlamaIndex, QLoRA, DeepSpeed, vLLM, DPO, LangGraph, RAGAS,
   YOLOv8, OpenCV, MinHash LSH, AWS, Azure, GCP, Docker, Terraform, CI/CD,
@@ -150,21 +152,20 @@ SKILLS — only from this list, never invent:
   Git, Jupyter, Power BI, SQLite, FFmpeg, OpenAI Whisper
 
 VERDICT RULES:
-  NO    — requires security clearance, citizenship, explicitly 4+ years, or no AI/ML/data relevance
+  NO    — requires security clearance, citizenship, or explicitly 4+ years experience
   YES   — strong AI/ML/LLM/data engineering match, 0-3 years level
   MAYBE — partial match or experience level unclear
 
 WRITING RULES:
   - Never say: thrilled, delighted, leveraging, spearheading, passionate, excited, honored
   - Never mention OPT, STEM, H1B, visa, citizenship
-  - cl_para1 and cl_para2 in first person (I, my, me)
+  - cl_para1 and cl_para2 in first person
   - summary_closing in third person (Tanay, his)
-  - cl_para4 second sentence must be exactly: I am authorized to work in the U.S.
+  - cl_para4 second sentence: I am authorized to work in the U.S.
 
 Output starts with { and ends with }. Nothing else."""
 
 CL_RETRY_PROMPT = """Output ONLY a valid JSON object with these 3 keys. Start with { end with }.
-
 {
   "cl_para1": "2-3 sentences opening a cover letter. Do not start with I am writing or I am excited.",
   "cl_para2": "2-3 sentences connecting the company work to LLM and RAG engineering experience.",
@@ -234,7 +235,6 @@ def build_cl_para3(projects):
     p2 = "P2" in projects
     p4 = "P4" in projects
     p5 = "P5" in projects
-
     if p1 and p2:
         return (
             r"My Distributed LLM Fine-Tuning Pipeline achieved 41.2\% per-GPU memory reduction "
@@ -242,15 +242,6 @@ def build_cl_para3(projects):
             r"with methodology published in UniLLMOps (Zenodo DOI: 10.5281/zenodo.19582347). "
             r"My Production RAG System delivered 23.7\% retrieval faithfulness gain using hybrid "
             r"Qdrant, Elasticsearch, and Neo4j retrieval with CRAG via LangGraph."
-        )
-    elif p1 and p5:
-        return (
-            r"My Distributed LLM Fine-Tuning Pipeline achieved 41.2\% per-GPU memory reduction "
-            r"and 3.8x inference throughput across 66 files and 11,000+ lines, published in "
-            r"UniLLMOps (Zenodo DOI: 10.5281/zenodo.19582347). "
-            r"My GCP cloud ML pipeline used PySpark for distributed preprocessing, and my "
-            r"Production RAG System delivered 23.7\% retrieval faithfulness gain --- covering "
-            r"both data engineering and AI deployment end-to-end."
         )
     elif p4:
         return (
@@ -265,7 +256,7 @@ def build_cl_para3(projects):
             r"My Production RAG System delivered 23.7\% retrieval faithfulness gain using hybrid "
             r"Qdrant, Elasticsearch, and Neo4j retrieval, published in UniLLMOps "
             r"(Zenodo DOI: 10.5281/zenodo.19582347). "
-            r"My GCP pipeline used PySpark for distributed preprocessing, and my LLM Fine-Tuning "
+            r"My GCP pipeline used PySpark for distributed preprocessing and my LLM Fine-Tuning "
             r"Pipeline achieved 41.2\% per-GPU memory reduction across 11,000+ lines."
         )
     else:
@@ -386,17 +377,14 @@ tanaytammineni22@gmail.com\ \textbar\ 816-277-9463\ \textbar\ USA\ \textbar\
 \href{https://github.com/TammineniTanay}{GitHub}\ \textbar\
 \href{https://tanaytammineni.vercel.app/}{Portfolio}
 \end{center}
-
 \section{Professional Summary}
 \noindent\small {{ summary_paragraph }}
-
 \section{Technical Toolkit}
 \noindent\small
 \textbf{AI/ML:} {{ skills_row1 }}\\
 \textbf{Data \& Cloud:} {{ skills_row2 }}\\
 \textbf{Backend \& Infra:} {{ skills_row3 }}\\
 \textbf{Tools \& Monitoring:} {{ skills_row4 }}
-
 \section{Professional Experience}
 \expheading{VoiceBotics AI}{Remote}{AI Systems Developer Intern}{Apr 2025 --- Present}
 \begin{cvbullets}
@@ -407,16 +395,13 @@ tanaytammineni22@gmail.com\ \textbar\ 816-277-9463\ \textbar\ USA\ \textbar\
 \begin{cvbullets}
 {{ gl_bullets }}
 \end{cvbullets}
-
 \section{Education}
 \noindent\begin{tabular*}{\textwidth}{@{}l@{\extracolsep{\fill}}r@{}}
 \textbf{Southeast Missouri State University} & Cape Girardeau, MO \\[-3pt]
 \textit{\small M.S. in Computer Science\ ---\ GPA: 3.9/4.0} & \textit{\small Jan 2024 -- Dec 2025} \\
 \end{tabular*}
-
 \section{Technical Projects}
 {{ projects_block }}
-
 \section{Publication \& Awards}
 \begin{cvbullets}
 \item \textbf{Published:} ``UniLLMOps: A Unified Framework for End-to-End LLM Production Systems''\ ---\ Zenodo, DOI: 10.5281/zenodo.19582347 (Apr 2026).
@@ -506,7 +491,6 @@ def call_ollama(system, prompt):
     try:
         resp = requests.post(OLLAMA_URL, json=payload, stream=True, timeout=None)
         if resp.status_code != 200:
-            print(f"    Ollama HTTP {resp.status_code}")
             return None
         print("    Thinking: ", end="", flush=True)
         text, n = "", 0
@@ -545,7 +529,6 @@ def check_pdflatex():
     return shutil.which("pdflatex") is not None
 
 def compile_pdf(tex, out_path):
-    """Run pdflatex FROM the output directory — fixes Windows long-path bug."""
     out_path = os.path.abspath(out_path)
     tex_file = out_path + ".tex"
     pdf_file = out_path + ".pdf"
@@ -556,8 +539,7 @@ def compile_pdf(tex, out_path):
     try:
         r = subprocess.run(
             ["pdflatex", "-interaction=nonstopmode", tex_name],
-            capture_output=True, text=True, timeout=60,
-            cwd=out_dir,
+            capture_output=True, text=True, timeout=60, cwd=out_dir,
         )
         ok = os.path.exists(pdf_file) and r.returncode == 0
         for ext in [".aux", ".log", ".out"]:
@@ -572,20 +554,19 @@ def compile_pdf(tex, out_path):
 # PROCESS ONE JOB
 # ─────────────────────────────────────────────────────────────────────────────
 
-def process_one_job(job_id, company, title, jd_text, conn):
+def process_one_job(job_id, company, title, jd_text, conn, is_linkedin=False):
     c = conn.cursor()
-
-    # fetch URL for job_info and ATS detection
-    c.execute("SELECT url FROM seen_jobs WHERE jobpostingid=?", (job_id,))
+    c.execute("SELECT url, status FROM seen_jobs WHERE jobpostingid=?", (job_id,))
     row = c.fetchone()
-    url = row[0] if row else ""
+    url            = row[0] if row else ""
+    current_status = row[1] if row else "TO_PROCESS"
 
-    # date-based output folder: output/YYYY-MM-DD/company_role/
     safe   = re.sub(r"[^a-zA-Z0-9_]", "_", f"{company}_{title}")[:55]
     outdir = os.path.join(TODAY_DIR, safe)
     os.makedirs(outdir, exist_ok=True)
 
-    print(f"\n  [{company}] {title}")
+    linkedin_tag = " [LinkedIn]" if is_linkedin else ""
+    print(f"\n  [{company}] {title}{linkedin_tag}")
 
     jd_snip = (jd_text or "")[:2500]
     raw     = call_ollama(
@@ -610,15 +591,14 @@ def process_one_job(job_id, company, title, jd_text, conn):
     with open(os.path.join(outdir, "decision.json"), "w", encoding="utf-8") as f:
         json.dump(dec, f, indent=2)
 
-    # write job_info for ALL verdicts including NO
     write_job_info(outdir, company, title, url, verdict, reason)
 
-    if verdict == "NO":
+    if verdict == "NO" and not is_linkedin:
         c.execute("UPDATE seen_jobs SET status='SKIPPED_NO' WHERE jobpostingid=?", (job_id,))
         conn.commit()
         return "NO"
 
-    # CL paras 1/2/4 with retry
+    # CL paras with retry
     para1 = clean_text(dec.get("cl_para1", ""))
     para2 = clean_text(dec.get("cl_para2", ""))
     para4 = clean_text(dec.get("cl_para4", ""))
@@ -641,8 +621,7 @@ def process_one_job(job_id, company, title, jd_text, conn):
                  f"been building over the past year.")
     if not para2:
         para2 = (f"{company}'s applied AI work aligns with my experience building "
-                 f"LLM pipelines, RAG systems, and cloud-native ML infrastructure "
-                 f"end-to-end.")
+                 f"LLM pipelines, RAG systems, and cloud-native ML infrastructure.")
     if not para4:
         para4 = (f"I would welcome the opportunity to discuss how my background "
                  f"aligns with {company}'s engineering goals. "
@@ -661,15 +640,15 @@ def process_one_job(job_id, company, title, jd_text, conn):
     proj_block = build_projects_block(projects)
 
     resume_latex = fill_template(RESUME_TEMPLATE,
-        summary_paragraph = summary_p,
-        skills_row1 = rows["row1"], skills_row2 = rows["row2"],
-        skills_row3 = rows["row3"], skills_row4 = rows["row4"],
-        vb_bullets  = vb_bullets,  gl_bullets   = gl_bullets,
-        projects_block = proj_block,
+        summary_paragraph=summary_p,
+        skills_row1=rows["row1"], skills_row2=rows["row2"],
+        skills_row3=rows["row3"], skills_row4=rows["row4"],
+        vb_bullets=vb_bullets, gl_bullets=gl_bullets,
+        projects_block=proj_block,
     )
     cl_latex = fill_template(CL_TEMPLATE,
         company=company, para1=para1, para2=para2,
-        para3=para3,     para4=para4,
+        para3=para3, para4=para4,
     )
 
     res_path = os.path.join(outdir, "resume")
@@ -686,7 +665,7 @@ def process_one_job(job_id, company, title, jd_text, conn):
         if r_ok and c_ok:
             print(f"    PDFs compiled -> {outdir}/")
         elif r_ok:
-            print(f"    Resume PDF ok. Cover letter .tex only -> {outdir}/")
+            print(f"    Resume PDF ok. CL .tex only -> {outdir}/")
         else:
             print(f"    .tex saved (compile error) -> {outdir}/")
             if r_err:
@@ -694,8 +673,14 @@ def process_one_job(job_id, company, title, jd_text, conn):
     else:
         print(f"    .tex saved -> {outdir}/")
 
-    c.execute("UPDATE seen_jobs SET status=? WHERE jobpostingid=?",
-              (f"GENERATED_{verdict}", job_id))
+    # LinkedIn jobs stay as MANUAL_APPLY
+    # Others get GENERATED_YES/MAYBE
+    if is_linkedin:
+        # keep MANUAL_APPLY status — just update so we know PDF was generated
+        c.execute("UPDATE seen_jobs SET status='MANUAL_APPLY' WHERE jobpostingid=?", (job_id,))
+    else:
+        c.execute("UPDATE seen_jobs SET status=? WHERE jobpostingid=?",
+                  (f"GENERATED_{verdict}", job_id))
     conn.commit()
     return verdict
 
@@ -703,35 +688,64 @@ def process_one_job(job_id, company, title, jd_text, conn):
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main(db_path="job_agent.db"):
+def main(db_path=r"C:\JobAgentData\job_agent.db"):
     os.makedirs(TODAY_DIR, exist_ok=True)
     conn = sqlite3.connect(db_path)
     c    = conn.cursor()
 
+    # auto-retry previously failed jobs
     c.execute("UPDATE seen_jobs SET status='TO_PROCESS' WHERE status='FAILED'")
     conn.commit()
 
+    # get both TO_PROCESS and MANUAL_APPLY (LinkedIn) jobs without PDFs
     c.execute("""
-        SELECT jobpostingid, company, title, jd_text
-        FROM seen_jobs WHERE status='TO_PROCESS'
+        SELECT jobpostingid, company, title, jd_text, status, url
+        FROM seen_jobs
+        WHERE status IN ('TO_PROCESS', 'MANUAL_APPLY')
+        ORDER BY CASE status WHEN 'TO_PROCESS' THEN 0 ELSE 1 END, date_found DESC
     """)
-    jobs  = c.fetchall()
+    all_jobs = c.fetchall()
+
+    # filter out LinkedIn jobs that already have PDFs
+    jobs = []
+    for row in all_jobs:
+        job_id, company, title, jd_text, status, url = row
+        safe   = re.sub(r"[^a-zA-Z0-9_]", "_", f"{company}_{title}")[:55]
+        # check if PDF already exists in any date folder
+        has_pdf = False
+        if os.path.isdir(OUTPUT_DIR):
+            for dd in os.listdir(OUTPUT_DIR):
+                cand = os.path.join(OUTPUT_DIR, dd, safe, "resume.pdf")
+                if os.path.exists(cand):
+                    has_pdf = True
+                    break
+        if status == "MANUAL_APPLY" and has_pdf:
+            continue   # already has PDF, skip
+        jobs.append(row)
+
     total = len(jobs)
 
     if not jobs:
-        print("No jobs queued. Run stage1_ingest.py first.")
+        print("No jobs queued.")
         conn.close()
         return {}
 
+    auto_count = sum(1 for j in jobs if j[4] == "TO_PROCESS")
+    li_count   = sum(1 for j in jobs if j[4] == "MANUAL_APPLY")
     print(f"\n=== Stage 2: {total} job(s) — saving to {TODAY_DIR}/ ===")
+    print(f"  Auto-apply: {auto_count}  |  LinkedIn manual: {li_count}")
     if not check_pdflatex():
         print("NOTE: pdflatex not found — .tex only.\n")
 
-    results = {"YES": 0, "MAYBE": 0, "NO": 0, "FAILED": 0}
-    for i, (job_id, company, title, jd_text) in enumerate(jobs, 1):
+    results = {"YES": 0, "MAYBE": 0, "NO": 0, "FAILED": 0, "LINKEDIN": 0}
+    for i, (job_id, company, title, jd_text, status, url) in enumerate(jobs, 1):
+        is_li = "linkedin.com" in (url or "").lower() or status == "MANUAL_APPLY"
         print(f"\n[{i}/{total}]", end="")
-        v = process_one_job(job_id, company, title, jd_text, conn)
-        results[v if v in results else "FAILED"] += 1
+        v = process_one_job(job_id, company, title, jd_text, conn, is_linkedin=is_li)
+        if is_li:
+            results["LINKEDIN"] += 1
+        else:
+            results[v if v in results else "FAILED"] += 1
         if i < total:
             print(f"    Cooling down {JOB_COOLDOWN}s...")
             time.sleep(JOB_COOLDOWN)

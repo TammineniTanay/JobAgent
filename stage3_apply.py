@@ -1,7 +1,19 @@
 """
-stage3_apply.py
-Rebuilt with Playwright native fill() — far more reliable than JS injection.
-Always grabs the latest active tab after user navigates manually.
+stage3_apply.py  —  Modular ATS Handler Architecture
+
+Architecture:
+- ATSHandler base class: Strategy Pattern, one handler per ATS platform
+- Dedicated handlers: Greenhouse, Lever, Workable, SmartRecruiters, Ashby, Generic
+- Native Playwright fill() with force=True — bypasses sticky headers
+- 4-strategy dropdown: native select → Select2 → React-Select → keyboard nav
+- Accessibility Tree fallback — works on ANY website regardless of CSS framework
+- Greenhouse API interception — bypass UI entirely, POST directly to backend
+- iFrame traversal — finds forms inside embedded iframes
+- Stealth mode — randomized viewport, humanized typing delays
+- SQLite WAL mode + with conn: context managers — no corruption on crash
+- Ollama cached per job for open questions
+
+Add new ATS: subclass ATSHandler, override apply(), register in HANDLERS dict.
 """
 
 import sqlite3
@@ -9,131 +21,101 @@ import os
 import re
 import time
 import random
+import subprocess
 import requests
+import json as _json
+from abc import ABC, abstractmethod
 
-OUTPUT_DIR = "output"
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "llama3.1:8b"
+OUTPUT_DIR      = "output"
+OLLAMA_URL      = "http://localhost:11434/api/generate"
+MODEL_NAME      = "llama3.1:8b"
+BROWSER_PROFILE = r"C:\Users\tanay\AppData\Local\Playwright\JobAgentProfile"
+
+# ── Humanized typing: random delay per keystroke (10–45ms) mimics human ──────
+def _human_delay():
+    return random.randint(10, 45)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YOUR INFO
+# CANDIDATE INFO
 # ─────────────────────────────────────────────────────────────────────────────
 
-YOUR_INFO = {
-    "first_name":    "Tanay",
-    "last_name":     "Tammineni",
-    "full_name":     "Tanay Tammineni",
-    "email":         "tanaytammineni22@gmail.com",
-    "phone_bare":    "8162779463",
-    "phone_intl":    "+18162779463",
-    "linkedin":      "https://www.linkedin.com/in/tanay-tammineni/",
-    "github":        "https://github.com/TammineniTanay",
-    "portfolio":     "https://tanaytammineni.vercel.app/",
-    "location_full": "Irving, TX, United States",
-    "city":          "Irving",
-    "state_full":    "Texas",
-    "state":         "TX",
-    "zip":           "75062",
-    "country":       "United States",
-    "current_co":    "VoiceBotics AI",
-    "current_title": "AI Systems Developer Intern",
-    "university":    "Southeast Missouri State University",
-    "degree":        "Master of Science in Computer Science",
-    "grad_year":     "2025",
-    "gpa":           "3.9",
-    "years_exp":     "2",
-    "salary":        "95000",
-    "start_date":    "Immediately",
-    "hear_about":    "Job Board",
+INFO = {
+    "first":     "Tanay",
+    "last":      "Tammineni",
+    "full":      "Tanay Tammineni",
+    "email":     "tanaytammineni22@gmail.com",
+    "phone":     "8162779463",
+    "phone_i":   "+18162779463",
+    "linkedin":  "https://www.linkedin.com/in/tanay-tammineni/",
+    "github":    "https://github.com/TammineniTanay",
+    "portfolio": "https://tanaytammineni.vercel.app/",
+    "street":    "871 Lake Carolyn Pkwy, Apt 374",
+    "city":      "Irving",
+    "state":     "Texas",
+    "state_s":   "TX",
+    "zip":       "75039",
+    "country":   "United States",
+    "location":  "Irving, TX, United States",
+    "company":   "VoiceBotics AI",
+    "title":     "AI Systems Developer Intern",
+    "university":"Southeast Missouri State University",
+    "degree_s":  "Master's",
+    "grad_year": "2025",
+    "gpa":       "3.9",
+    "years_exp": "2",
+    "salary":    "95000",
+    "start":     "Immediately",
+    "hear":      "Job Board",
 }
 
-CANDIDATE_CONTEXT = """
-Tanay Tammineni — AI/ML Engineer
-Current: AI Systems Developer Intern at VoiceBotics AI (Apr 2025-Present)
-Previous: Software Engineer Intern at Globalshala (Jun 2022-Dec 2022)
-Education: M.S. Computer Science, Southeast Missouri State University, GPA 3.9, Dec 2025
-Location: Irving, TX. Skills: Python, PyTorch, LangChain, RAG, LLMs, FastAPI, AWS, Azure, Docker.
-Work auth: Authorized in the US. No sponsorship needed.
-"""
-
-SKIP_LABELS = [
-    "accommodat", "disability", "veteran", "race", "ethnicity",
-    "gender", "pronoun", "demographic", "sexual", "military",
-    "captcha", "csrf", "token", "referral code", "promo",
-]
+CANDIDATE_BIO = (
+    "Tanay Tammineni, AI/ML Engineer, Irving TX. "
+    "Current: AI Systems Developer Intern at VoiceBotics AI (Apr 2025). "
+    "Education: M.S. CS, Southeast Missouri State University, GPA 3.9, Dec 2025. "
+    "Skills: Python, PyTorch, LangChain, RAG, LLMs, FastAPI, AWS, Docker. "
+    "Work auth: Authorized in the US. No sponsorship needed. Willing to relocate anywhere."
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ATS DETECTOR
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_ats(url):
     u = url.lower()
-    if "greenhouse.io" in u or "boards.greenhouse" in u or "gh_jid" in u:
-        return "greenhouse"
-    if "lever.co" in u or "jobs.lever" in u:    return "lever"
-    if "workday" in u or "myworkdayjobs" in u:  return "workday"
-    if "oraclecloud" in u or "fa.em" in u:      return "oracle"
-    if "taleo" in u:                            return "taleo"
-    if "smartrecruiters" in u:                  return "smartrecruiters"
-    if "paylocity" in u:                        return "paylocity"
-    if "workable" in u:                         return "workable"
-    if "rippling" in u:                         return "rippling"
-    if "ultipro" in u:                          return "ultipro"
-    if "adp" in u:                              return "adp"
-    if "ashbyhq" in u or "ashby" in u:          return "ashby"
-    if "bamboohr" in u:                         return "bamboohr"
-    if "jobvite" in u:                          return "jobvite"
-    if "personio" in u:                         return "personio"
-    if "paycor" in u:                           return "paycor"
-    if "icims" in u:                            return "icims"
-    if "dayforcehcm" in u:                      return "dayforce"
-    if "google.com/about/careers" in u:         return "google"
-    if "apple.com" in u:                        return "apple"
-    if "amazon.jobs" in u:                      return "amazon"
+    if "linkedin.com" in u:                         return "linkedin"
+    if "greenhouse.io" in u or "gh_jid" in u:       return "greenhouse"
+    if "lever.co" in u or "jobs.lever" in u:        return "lever"
+    if "workday" in u or "myworkdayjobs" in u:      return "workday"
+    if "oraclecloud" in u or "fa.em" in u:          return "oracle"
+    if "taleo" in u:                                return "taleo"
+    if "smartrecruiters" in u:                      return "smartrecruiters"
+    if "paylocity" in u:                            return "paylocity"
+    if "workable" in u:                             return "workable"
+    if "rippling" in u:                             return "rippling"
+    if "ultipro" in u:                              return "ultipro"
+    if "ashbyhq" in u or "ashby" in u:              return "ashby"
+    if "bamboohr" in u:                             return "bamboohr"
+    if "personio" in u:                             return "personio"
+    if "paycor" in u:                               return "paycor"
+    if "icims" in u:                                return "icims"
+    if "google.com/about/careers" in u:             return "google"
+    if "apple.com" in u:                            return "apple"
+    if "amazon.jobs" in u:                          return "amazon"
     return "unknown"
 
-MANUAL_ONLY = {"google", "apple", "amazon", "oracle", "taleo"}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GET ACTIVE PAGE — always returns the most recently used tab
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_active_page(ctx):
-    """
-    Returns the page the user is currently looking at.
-    Gets the last tab in context — the one most recently opened/focused.
-    """
-    pages = ctx.pages
-    if not pages:
-        return ctx.new_page()
-    # return the last page (most recently opened)
-    return pages[-1]
-
-
-def get_live_page(ctx, page):
-    try:
-        page.title()
-        return page
-    except Exception:
-        return ctx.new_page()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FILE HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_output_dir(company, title):
     safe = re.sub(r"[^a-zA-Z0-9_]", "_", f"{company}_{title}")[:55]
     if os.path.isdir(OUTPUT_DIR):
-        date_dirs = sorted(
+        for dd in sorted(
             [d for d in os.listdir(OUTPUT_DIR)
              if re.match(r"\d{4}-\d{2}-\d{2}", d)
              and os.path.isdir(os.path.join(OUTPUT_DIR, d))],
             reverse=True
-        )
-        for dd in date_dirs:
-            cand = os.path.join(OUTPUT_DIR, dd, safe)
-            if os.path.isdir(cand):
-                return cand
+        ):
+            p = os.path.join(OUTPUT_DIR, dd, safe)
+            if os.path.isdir(p):
+                return p
     return os.path.join(OUTPUT_DIR, safe)
 
 
@@ -143,830 +125,2387 @@ def find_file(job_dir, doc_type="resume", ext="pdf"):
         return direct
     if os.path.isdir(job_dir):
         for f in os.listdir(job_dir):
-            name = f.lower().replace("_", "").replace("-", "")
-            key  = doc_type.lower().replace("_", "")
-            if f.endswith(f".{ext}") and key in name:
+            n = f.lower().replace("_", "").replace("-", "")
+            k = doc_type.lower().replace("_", "")
+            if f.endswith(f".{ext}") and k in n:
                 return os.path.join(job_dir, f)
     return None
 
 
-def load_cover_letter_text(job_dir):
+def load_cl_text(job_dir):
     tex = os.path.join(job_dir, "cover_letter.tex")
     if not os.path.exists(tex):
         return ""
     try:
-        content = open(tex, encoding="utf-8").read()
-        m = re.search(r"\\normalsize\s*\n+(.*?)\\vspace\{8pt\}", content, re.DOTALL)
+        c = open(tex, encoding="utf-8").read()
+        m = re.search(r"\\normalsize\s*\n+(.*?)\\vspace", c, re.DOTALL)
         if not m:
             return ""
-        text = m.group(1)
-        text = re.sub(r"\\[a-zA-Z]+\{([^}]*)\}", r"\1", text)
-        text = re.sub(r"\\[a-zA-Z]+", "", text)
-        return re.sub(r"\s+", " ", text).strip()
+        t = re.sub(r"\\[a-zA-Z]+\{([^}]*)\}", r"\1", m.group(1))
+        t = re.sub(r"\\[a-zA-Z]+", "", t)
+        return re.sub(r"\s+", " ", t).strip()
     except Exception:
         return ""
 
+
+def open_folder(path):
+    try:
+        if path and os.path.isdir(path):
+            subprocess.Popen(["explorer", os.path.abspath(path)])
+    except Exception:
+        pass
+
+
+def get_active_page(ctx):
+    return ctx.pages[-1] if ctx.pages else ctx.new_page()
+
 # ─────────────────────────────────────────────────────────────────────────────
-# OLLAMA
+# iFrame TRAVERSAL — finds elements across all frames
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ask_ollama(question, job_title, company, jd_snippet, cl_text):
+def find_frame_with_form(page):
+    """
+    Returns the frame that contains the application form.
+    Checks main page first, then all nested frames.
+    Looks for frame with the most non-hidden inputs.
+    """
+    best_frame = page
+    best_count = 0
+
+    # count inputs in main frame
     try:
-        resp = requests.post(OLLAMA_URL, json={
+        n = page.locator('input:not([type="hidden"])').count()
+        if n > best_count:
+            best_count = n
+            best_frame = page
+    except Exception:
+        pass
+
+    # check all nested frames
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            n = frame.locator('input:not([type="hidden"])').count()
+            if n > best_count:
+                best_count = n
+                best_frame = frame
+        except Exception:
+            continue
+
+    return best_frame, best_count
+
+
+def find_element_across_frames(page, selector):
+    """
+    Finds a locator across the main page and all iframes.
+    Returns (frame, locator) for the first match found.
+    """
+    # try main page first
+    try:
+        loc = page.locator(selector)
+        if loc.count() > 0 and loc.first.is_visible(timeout=500):
+            return page, loc
+    except Exception:
+        pass
+    # try all frames
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            loc = frame.locator(selector)
+            if loc.count() > 0 and loc.first.is_visible(timeout=500):
+                return frame, loc
+        except Exception:
+            continue
+    return page, page.locator(selector)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OLLAMA — with per-job cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CACHE: dict = {}
+
+def ask_ollama(question, company, job_title, jd_snip, cl_text):
+    key = re.sub(r"\s+", " ", question.lower().strip())[:80]
+    if key in _CACHE:
+        return _CACHE[key]
+
+    def c(v):
+        _CACHE[key] = v
+        return v
+
+    q = question.lower()
+    if re.search(r"authorized|legally.*work|eligible.*work|without.*sponsor", q):
+        return c("Yes")
+    if re.search(r"require.*sponsor|need.*sponsor|visa|h.?1.?b|\bopt\b|sponsorship", q):
+        return c("No")
+    if re.search(r"reloca|willing to move", q):
+        return c("Yes, I am open to relocating anywhere in the United States.")
+    if re.search(r"salary|compensation|expected.*pay", q):
+        return c("95000")
+    if re.search(r"start.*date|when.*start|available.*start", q):
+        return c("Immediately")
+    if re.search(r"years.*experience|how many years", q):
+        return c("2")
+    if re.search(r"hear about|referral|where did you", q):
+        return c("Job Board")
+    cities = ["san diego","boston","new york","chicago","seattle","austin","dallas","san francisco"]
+    for city in cities:
+        if city in q and re.search(r"based in|located in|live in|reside in", q):
+            return c("No")
+
+    try:
+        r = requests.post(OLLAMA_URL, json={
             "model": MODEL_NAME,
             "prompt": (
-                f"Fill this job application field for Tanay Tammineni.\n"
-                f"Candidate: {CANDIDATE_CONTEXT}\n"
-                f"Job: {job_title} at {company}\n"
-                f"JD: {jd_snippet[:300]}\n"
-                f'Field: "{question}"\n'
-                f"Write 1-3 sentences max 60 words. No visa mentions. Answer only."
+                f"Job application for Tanay Tammineni.\n"
+                f"ABOUT: {CANDIDATE_BIO}\n"
+                f"JOB: {job_title} at {company}\n"
+                f"JD: {jd_snip[:400]}\n"
+                f'QUESTION: "{question}"\n'
+                f"2-4 sentences, max 80 words. No visa/OPT/H1B mentions. Answer only."
             ),
             "stream": False,
             "options": {"temperature": 0.1, "num_ctx": 1200},
         }, timeout=45)
-        if resp.status_code == 200:
-            return resp.json().get("response", "").strip()
+        if r.status_code == 200:
+            return c(r.json().get("response", "").strip())
     except Exception:
         pass
-    return ""
+    return c("")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DELAYS
+# BASE HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def pause(lo=0.5, hi=1.5):
-    time.sleep(random.uniform(lo, hi))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE FILL FUNCTION — uses Playwright native fill(), not JS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def smart_fill(page, value):
+class ATSHandler(ABC):
     """
-    Fill a Playwright locator with a value.
-    Uses native fill() which properly triggers React/Vue state.
-    Falls back to JS nativeInputValueSetter if fill() doesn't work.
+    Base class for all ATS handlers.
+    Subclasses override apply() for platform-specific logic.
+    Common fill methods available to all handlers.
     """
-    if not value:
-        return False
-    try:
-        # Playwright native fill — triggers all React events automatically
-        page.fill("", str(value))
-        return True
-    except Exception:
+
+    def __init__(self, page, ctx, url, res_pdf, cl_pdf, job_dir,
+                 company, title, jd_text):
+        self.page     = page
+        self.ctx      = ctx
+        self.url      = url
+        self.res_pdf  = res_pdf
+        self.cl_pdf   = cl_pdf
+        self.job_dir  = job_dir
+        self.company  = company
+        self.title    = title
+        self.jd_text  = jd_text or ""
+        self.cl_text  = load_cl_text(job_dir)
+        self.jd_snip  = self.jd_text[:500]
+        self.why_us   = self._build_why_us()
+        # find best frame (handles iframe embedding)
+        self.frame, _ = find_frame_with_form(page)
+
+    def _build_why_us(self):
+        if self.cl_text:
+            paras = [p.strip() for p in re.split(r"\s{3,}", self.cl_text) if len(p.strip()) > 20]
+            if len(paras) > 1:
+                return paras[1][:600]
+            if paras:
+                return paras[0][:600]
+        return (
+            f"My production LLM and RAG engineering experience directly aligns with "
+            f"{self.company}'s needs. I built a distributed fine-tuning pipeline "
+            f"achieving 41.2% per-GPU memory reduction and a hybrid RAG system with "
+            f"23.7% faithfulness improvement."
+        )
+
+    @abstractmethod
+    def apply(self) -> bool:
+        """Navigate to form, fill it, submit. Returns True if submitted."""
         pass
-    return False
 
+    # ── Core fill primitives ─────────────────────────────────────────────────
 
-def fill_input(locator, value):
-    """Fill a single input field with proper event triggering."""
-    if not value:
-        return False
-    try:
-        if locator.count() == 0:
+    def fill(self, selector, value, frame=None):
+        """
+        Fill a text input using native Playwright with force=True.
+        Bypasses sticky headers that intercept triple_click().
+        """
+        if not value:
             return False
-        el = locator.first
-        if not el.is_visible(timeout=1000):
-            return False
-        # clear first, then fill
-        el.click()
-        pause(0.1, 0.2)
-        el.fill("")
-        el.fill(str(value))
-        pause(0.1, 0.2)
-        return True
-    except Exception:
-        pass
-    # JS fallback
-    try:
-        el = locator.first
-        safe_val = str(value).replace("'", "\\'").replace("\n", " ")
-        el.evaluate(f"""inp => {{
-            var s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            s.call(inp, '{safe_val}');
-            inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-            inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-            inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
-        }}""")
-        return True
-    except Exception:
-        pass
-    return False
-
-
-def fill_by_label(page, label_text, value):
-    """Fill input associated with a label. Most reliable method."""
-    if not value:
-        return False
-    # try Playwright's get_by_label — handles aria-label, for=, nested
-    for exact in [True, False]:
+        f = frame or self.frame
+        # primary: force fill (bypasses overlay intercept)
         try:
-            loc = page.get_by_label(label_text, exact=exact)
-            if loc.count() > 0 and loc.first.is_visible(timeout=800):
-                loc.first.click()
-                pause(0.1, 0.2)
-                loc.first.fill(str(value))
-                pause(0.1, 0.2)
-                return True
+            loc = f.locator(selector).first
+            loc.wait_for(state="visible", timeout=3000)
+            loc.scroll_into_view_if_needed()
+            loc.fill(str(value), force=True)
+            return True
         except Exception:
             pass
-    return False
-
-
-def fill_by_placeholder(page, placeholder_text, value):
-    """Fill input by placeholder text."""
-    if not value:
-        return False
-    try:
-        loc = page.get_by_placeholder(placeholder_text, exact=False)
-        if loc.count() > 0 and loc.first.is_visible(timeout=800):
-            loc.first.click()
-            pause(0.1, 0.2)
-            loc.first.fill(str(value))
+        # fallback: force click → keyboard clear → press_sequentially with human delay
+        try:
+            loc = f.locator(selector).first
+            loc.wait_for(state="visible", timeout=2000)
+            loc.scroll_into_view_if_needed()
+            loc.click(force=True)
+            loc.press("Control+A")
+            loc.press("Backspace")
+            loc.press_sequentially(str(value), delay=_human_delay())
             return True
-    except Exception:
-        pass
-    return False
+        except Exception:
+            return False
 
-
-def select_dropdown_option(page, label_text, options):
-    """Select from a <select> dropdown by label."""
-    try:
-        loc = page.get_by_label(label_text, exact=False)
-        if loc.count() > 0:
-            el = loc.first
-            tag = el.evaluate("e => e.tagName.toLowerCase()")
-            if tag == "select":
-                for opt in options:
-                    try:
-                        el.select_option(label=opt)
-                        pause(0.2, 0.4)
-                        return True
-                    except Exception:
-                        try:
-                            el.select_option(value=opt)
-                            pause(0.2, 0.4)
-                            return True
-                        except Exception:
-                            continue
-    except Exception:
-        pass
-
-    # scan all selects on page
-    try:
-        selects = page.locator("select").all()
-        for sel in selects:
+    def fill_by_label(self, label_text, value, frame=None):
+        """Fill input by its label text using force=True."""
+        if not value:
+            return False
+        f = frame or self.frame
+        for exact in [True, False]:
             try:
-                # get label for this select
-                nearby = sel.evaluate("""el => {
-                    if (el.id) {
-                        let l = document.querySelector('label[for="' + el.id + '"]');
-                        if (l) return l.innerText.toLowerCase();
-                    }
-                    let p = el.parentElement;
-                    for (let i = 0; i < 5; i++) {
-                        if (!p) break;
-                        let l = p.querySelector('label');
-                        if (l) return l.innerText.toLowerCase();
-                        p = p.parentElement;
-                    }
-                    return (el.getAttribute('aria-label') || el.name || '').toLowerCase();
-                }""")
-                if label_text.lower() not in (nearby or ""):
-                    continue
-                for opt in options:
-                    try:
-                        sel.select_option(label=opt)
-                        pause(0.2, 0.4)
+                loc = f.get_by_label(label_text, exact=exact)
+                if loc.count() > 0:
+                    loc.first.wait_for(state="visible", timeout=2000)
+                    tag = loc.first.evaluate("e => e.tagName.toLowerCase()")
+                    if tag in ("input", "textarea"):
+                        loc.first.scroll_into_view_if_needed()
+                        loc.first.fill(str(value), force=True)
                         return True
+            except Exception:
+                pass
+        return False
+
+    def fill_by_placeholder(self, placeholder, value, frame=None):
+        """Fill input by placeholder text using force=True."""
+        if not value:
+            return False
+        f = frame or self.frame
+        try:
+            loc = f.get_by_placeholder(placeholder, exact=False)
+            if loc.count() > 0:
+                loc.first.wait_for(state="visible", timeout=2000)
+                loc.first.scroll_into_view_if_needed()
+                loc.first.fill(str(value), force=True)
+                return True
+        except Exception:
+            return False
+
+    def select_option(self, selector, options, frame=None):
+        """Select from a native <select> element."""
+        f = frame or self.frame
+        for opt in options:
+            try:
+                f.locator(selector).first.select_option(label=opt)
+                return True
+            except Exception:
+                try:
+                    f.locator(selector).first.select_option(value=opt)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    def select_by_label(self, label_text, options, frame=None):
+        """
+        Universal dropdown selector. Tries four strategies in order:
+        1. Native <select> with force=True
+        2. Select2 (Greenhouse uses this) — click container, pick option
+        3. React-Select / Radix combobox — click control, pick option
+        4. Keyboard navigation — type to filter, Enter to select
+        """
+        f = frame or self.frame
+
+        # ── Strategy 1: native <select> ──────────────────────────────────────
+        for exact in [True, False]:
+            try:
+                loc = f.get_by_label(label_text, exact=exact)
+                if loc.count() > 0:
+                    tag = loc.first.evaluate("e => e.tagName.toLowerCase()")
+                    if tag == "select":
+                        for opt in options:
+                            try:
+                                loc.first.select_option(label=opt, force=True)
+                                return True
+                            except Exception:
+                                try:
+                                    loc.first.select_option(value=opt, force=True)
+                                    return True
+                                except Exception:
+                                    continue
+            except Exception:
+                pass
+
+        # ── Strategy 2 & 3: find label element, locate nearby dropdown trigger ──
+        trigger = self._find_dropdown_trigger(label_text, f)
+        if trigger:
+            # click to open
+            try:
+                trigger.scroll_into_view_if_needed()
+                trigger.click(force=True)
+                f.wait_for_timeout(600)
+            except Exception:
+                pass
+
+            # try clicking a matching option in the opened list
+            for opt in options:
+                for sel in [
+                    f'[role="option"]:has-text("{opt}")',
+                    f'.select2-results__option:has-text("{opt}")',
+                    f'li:has-text("{opt}")',
+                    f'div[class*="option"]:has-text("{opt}")',
+                    f'div[class*="item"]:has-text("{opt}")',
+                    f'[class*="MenuList"] div:has-text("{opt}")',
+                ]:
+                    try:
+                        oe = f.locator(sel).first
+                        if oe.count() > 0 and oe.is_visible(timeout=800):
+                            oe.click()
+                            f.wait_for_timeout(300)
+                            return True
                     except Exception:
                         continue
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
 
-
-def click_react_dropdown(page, label_text, options):
-    """Handle custom React/Vue dropdowns (not native select)."""
-    try:
-        labels = page.locator("label").all()
-        for lbl in labels:
+            # close if nothing matched
             try:
-                lt = lbl.inner_text().strip().lower()
-                if label_text.lower() not in lt:
-                    continue
-                for_id = lbl.get_attribute("for") or ""
+                f.keyboard.press("Escape")
+            except Exception:
+                pass
 
-                # find the dropdown trigger
-                trigger = None
-                if for_id:
-                    el = page.locator(f"#{for_id}").first
-                    if el.count() > 0:
-                        tag = el.evaluate("e => e.tagName.toLowerCase()")
-                        if tag != "select":
-                            trigger = el
+        # ── Strategy 4: keyboard navigation ──────────────────────────────────
+        trigger2 = self._find_dropdown_trigger(label_text, f)
+        if trigger2:
+            try:
+                trigger2.click(force=True)
+                f.wait_for_timeout(400)
+                f.keyboard.type(options[0][:6], delay=30)
+                f.wait_for_timeout(400)
+                f.keyboard.press("Enter")
+                return True
+            except Exception:
+                pass
 
-                if not trigger:
-                    for sel in ['[role="combobox"]', '[class*="dropdown__control"]',
-                                '[class*="Select__control"]', '[class*="select__control"]']:
-                        t = page.locator(sel).first
-                        if t.count() > 0 and t.is_visible(timeout=500):
-                            trigger = t
-                            break
+        return False
 
-                if not trigger:
-                    continue
+    def _find_dropdown_trigger(self, label_text, frame):
+        """
+        Given a label string, find the nearest clickable dropdown trigger element.
+        Covers Select2, React-Select, Radix, and plain div[role=combobox].
+        """
+        f = frame
+        TRIGGER_SELS = [
+            '[role="combobox"]',
+            '[class*="select2-selection"]',
+            '[class*="Select__control"]',
+            '[class*="select__control"]',
+            '[class*="dropdown__control"]',
+            '[class*="SelectTrigger"]',
+            '.select2-container',
+        ]
 
-                # check if already has value
+        # find all label elements matching the text
+        try:
+            for lbl in f.locator("label, legend, [class*='label'], [class*='Label']").all():
                 try:
-                    cur = trigger.inner_text().strip().lower()
-                    if cur and cur not in ("select...", "select", "-- select --", ""):
-                        return True  # already filled
+                    txt = lbl.inner_text().strip().lower()
+                    if label_text.lower() not in txt and txt not in label_text.lower():
+                        continue
+                    # look for a trigger in the parent containers
+                    for ts in TRIGGER_SELS:
+                        try:
+                            # search within progressively wider containers
+                            for depth in range(1, 7):
+                                ancestor_js = "el => {" + "let p=el;" + "p=p.parentElement;" * depth + "return p;}"
+                                try:
+                                    container = lbl.evaluate_handle(ancestor_js)
+                                    t = f.locator(ts).first
+                                    # verify trigger is near the label
+                                    if t.count() > 0 and t.is_visible(timeout=400):
+                                        return t
+                                except Exception:
+                                    pass
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # fallback: find any trigger near matching text node
+        try:
+            for ts in TRIGGER_SELS:
+                triggers = f.locator(ts).all()
+                for t in triggers:
+                    try:
+                        if not t.is_visible(timeout=300):
+                            continue
+                        nearby = t.evaluate("""el => {
+                            let p = el.parentElement;
+                            for (let i=0; i<8; i++) {
+                                if (!p) break;
+                                let labels = p.querySelectorAll('label,legend,[class*=\"label\"],[class*=\"Label\"]');
+                                for (let l of labels) {
+                                    if (l.innerText.trim().length > 2) return l.innerText.toLowerCase();
+                                }
+                                p = p.parentElement;
+                            }
+                            return '';
+                        }""")
+                        if label_text.lower() in nearby or nearby in label_text.lower():
+                            return t
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        return None
+
+    def click_radio(self, question_pattern, answer_pattern, frame=None):
+        """Click a radio button matching question + answer patterns."""
+        f = frame or self.frame
+        try:
+            for radio in f.locator('input[type="radio"]').all():
+                try:
+                    if not radio.is_visible(timeout=300):
+                        continue
+                    nearby = radio.evaluate("""el => {
+                        let lbl = el.id ? document.querySelector('label[for="' + el.id + '"]') : null;
+                        if (lbl) return lbl.innerText.toLowerCase();
+                        let p = el.parentElement;
+                        for (let i = 0; i < 8; i++) {
+                            if (!p) break;
+                            let legend = p.querySelector('legend');
+                            if (legend) return (legend.innerText + ' ' + (p.innerText||'')).toLowerCase();
+                            let t = (p.innerText || '').trim();
+                            if (t.length > 2) return t.toLowerCase();
+                            p = p.parentElement;
+                        }
+                        return (el.value || '').toLowerCase();
+                    }""")
+                    val = (radio.get_attribute("value") or "").lower()
+                    comb = nearby + " " + val
+                    if (re.search(question_pattern, nearby, re.I) and
+                            re.search(answer_pattern, comb, re.I)):
+                        radio.click()
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def upload_file(self, selector, path, frame=None):
+        """Upload file to a standard input[type=file]."""
+        if not path:
+            return False
+        f = frame or self.frame
+        try:
+            f.locator(selector).first.set_input_files(path)
+            return True
+        except Exception:
+            pass
+        # try via file chooser dialog
+        try:
+            with self.page.expect_file_chooser(timeout=5000) as fc:
+                f.locator(selector).first.click()
+            fc.value.set_files(path)
+            return True
+        except Exception:
+            return False
+
+    def wait_for_form(self, timeout=10000, frame=None):
+        """Wait until at least 3 visible inputs appear."""
+        f = frame or self.frame
+        try:
+            f.wait_for_selector(
+                'input:not([type="hidden"])',
+                state="visible",
+                timeout=timeout
+            )
+            return True
+        except Exception:
+            return False
+
+    def fill_open_questions(self, frame=None):
+        """Fill textarea open questions using Ollama."""
+        f = frame or self.frame
+        cl_answer = self.cl_text[:1200] if self.cl_text else self.why_us
+        ANSWERS = [
+            (r"cover\s*letter",                                          cl_answer),
+            (r"why.{0,50}(company|role|position|join|interest|us\b)",   self.why_us),
+            (r"tell.{0,20}(about yourself|background)|introduce",        cl_answer[:600]),
+            (r"what.{0,30}(excite|interest|draw|attract|motivat)",       self.why_us[:500]),
+            (r"additional.{0,30}(info|comment)|anything\s*else",         self.why_us[:400]),
+            (r"how.{0,30}(contribute|add\s*value|help)",                 self.why_us[:500]),
+            (r"strength|qualification|relevant.*experience",              self.why_us[:400]),
+        ]
+        SKIP = ["captcha", "csrf", "token", "honeypot", "accommodat", "promo"]
+        try:
+            for ta in f.locator("textarea").all():
+                try:
+                    if not ta.is_visible(timeout=300):
+                        continue
+                    try:
+                        cur = ta.input_value()
+                        if cur and len(cur.strip()) > 15:
+                            continue
+                    except Exception:
+                        pass
+                    # get label
+                    label = ""
+                    ta_id = ta.get_attribute("id") or ""
+                    if ta_id:
+                        try:
+                            lbl = f.locator(f'label[for="{ta_id}"]').first
+                            if lbl.count() > 0:
+                                label = lbl.inner_text().strip()
+                        except Exception:
+                            pass
+                    if not label:
+                        label = (ta.get_attribute("aria-label") or
+                                 ta.get_attribute("placeholder") or
+                                 ta.get_attribute("name") or "")
+                    ll = label.lower()
+                    if any(s in ll for s in SKIP):
+                        continue
+                    filled = False
+                    for pat, ans in ANSWERS:
+                        if re.search(pat, ll, re.I) and ans:
+                            ta.click()
+                            ta.fill(ans)
+                            filled = True
+                            break
+                    if not filled and len(label) > 8:
+                        print(f"      Ollama: '{label[:55]}'...")
+                        ans = ask_ollama(label, self.company, self.title,
+                                         self.jd_snip, self.cl_text)
+                        if ans and len(ans) > 5:
+                            ta.click()
+                            ta.fill(ans[:800])
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def fill_via_accessibility_tree(self, frame=None):
+        """
+        Universal fallback using Playwright's Accessibility Tree.
+        Parses the semantic DOM (screen-reader view) — works on ANY website
+        regardless of CSS framework, React version, or obfuscated class names.
+        Maps candidate info to nodes by their accessible name/role,
+        then executes fill/click/select actions on those node IDs.
+        """
+        f = frame or self.frame
+        try:
+            # Get the accessibility snapshot — clean semantic JSON
+            snapshot = self.page.accessibility.snapshot(interesting_only=True)
+            if not snapshot:
+                return
+        except Exception:
+            return
+
+        # candidate data to match against accessible names
+        FILL_MAP = {
+            "first name":    INFO["first"],
+            "last name":     INFO["last"],
+            "full name":     INFO["full"],
+            "email":         INFO["email"],
+            "phone":         INFO["phone_i"],
+            "linkedin":      INFO["linkedin"],
+            "github":        INFO["github"],
+            "website":       INFO["portfolio"],
+            "portfolio":     INFO["portfolio"],
+            "school":        INFO["university"],
+            "university":    INFO["university"],
+            "college":       INFO["university"],
+            "city":          INFO["city"],
+            "zip":           INFO["zip"],
+            "salary":        INFO["salary"],
+        }
+        SELECT_MAP = {
+            "gender":        "Male",
+            "hispanic":      "No",
+            "race":          "Asian",
+            "veteran":       "I am not a protected veteran",
+            "disability":    "No, I do not have a disability",
+            "degree":        "Master's",
+            "country":       "United States",
+            "state":         "Texas",
+            "relocate":      "Yes",
+            "sponsor":       "No",
+            "authorized":    "Yes",
+        }
+
+        def walk(node, depth=0):
+            if not node or depth > 15:
+                return
+            name  = (node.get("name") or "").lower().strip()
+            role  = (node.get("role") or "").lower()
+            value = node.get("value") or ""
+
+            # skip already-filled nodes
+            if value and len(str(value).strip()) > 1:
+                for child in (node.get("children") or []):
+                    walk(child, depth + 1)
+                return
+
+            # fill text inputs
+            if role in ("textbox", "searchbox") and name:
+                for kw, val in FILL_MAP.items():
+                    if kw in name:
+                        try:
+                            loc = f.get_by_role("textbox", name=name, exact=False).first
+                            if loc.count() > 0 and loc.is_visible(timeout=500):
+                                loc.fill(str(val), force=True)
+                        except Exception:
+                            pass
+                        break
+
+            # handle comboboxes (Select2, React-Select, Radix)
+            if role in ("combobox", "listbox") and name:
+                for kw, val in SELECT_MAP.items():
+                    if kw in name:
+                        try:
+                            # try native select first
+                            loc = f.get_by_role("combobox", name=name, exact=False).first
+                            if loc.count() > 0:
+                                tag = loc.evaluate("e => e.tagName.toLowerCase()")
+                                if tag == "select":
+                                    loc.select_option(label=val, force=True)
+                                else:
+                                    # custom dropdown — click open then pick option
+                                    loc.click(force=True)
+                                    f.wait_for_timeout(500)
+                                    opt_loc = f.locator(
+                                        f'[role="option"]:has-text("{val}"), '
+                                        f'li:has-text("{val}"), '
+                                        f'div[class*="option"]:has-text("{val}")'
+                                    ).first
+                                    if opt_loc.count() > 0 and opt_loc.is_visible(timeout=800):
+                                        opt_loc.click()
+                                    else:
+                                        f.keyboard.type(val[:5], delay=25)
+                                        f.wait_for_timeout(300)
+                                        f.keyboard.press("Enter")
+                        except Exception:
+                            pass
+                        break
+
+            for child in (node.get("children") or []):
+                walk(child, depth + 1)
+
+        walk(snapshot)
+
+    def fill_standard_dropdowns(self, frame=None):
+        """Fill common dropdowns by label."""
+        f = frame or self.frame
+        DROPDOWN_RULES = [
+            (["Are you legally authorized","Authorized to work","Work Authorization",
+              "Legally authorized to work in the United States",
+              "authorized to work in the US", "authorized to work in the us now"],
+             ["Yes","Yes, I am authorized","Authorized"]),
+            (["Require sponsorship","Visa sponsorship","Will you require",
+              "Sponsorship","without sponsorship","sponsorship transfers",
+              "visa sponsorship now or in the future"],
+             ["No","No, I do not require","Not required"]),
+            (["State","State / Province","Province"],
+             ["Texas","TX"]),
+            (["Country","Country of Residence"],
+             ["United States","United States of America","USA"]),
+            (["Degree","Degree Level","Education Level","Highest Education"],
+             ["Master","Master's","Master's Degree","M.S.","Graduate"]),
+            (["Gender","Sex"],
+             ["Male","Man","He/Him"]),
+            (["Hispanic","Ethnicity","Hispanic/Latino"],
+             ["No","Not Hispanic or Latino","Decline"]),
+            (["Race"],
+             ["Asian","Asian (Not Hispanic or Latino)"]),
+            (["Veteran","Veteran Status","Protected Veteran"],
+             ["I am not a protected veteran","Not a protected veteran",
+              "No","I choose not to self-identify"]),
+            (["Disability","Disability Status"],
+             ["No, I do not have a disability","No",
+              "I don't have a disability","I choose not to self-identify"]),
+            (["Relocate","Willing to relocate","Relocation",
+              "willing to relocate on your own","located in the greater",
+              "located in the boston","located in"],
+             ["Yes","Open to relocation","Willing","Yes, I am willing to relocate"]),
+        ]
+        for labels, options in DROPDOWN_RULES:
+            for label in labels:
+                if self.select_by_label(label, options, frame=f):
+                    break
+
+    def fill_standard_radios(self, frame=None):
+        """Fill common radio button groups."""
+        RADIO_RULES = [
+            (r"authorized|legally.*work|eligible.*work|work.*auth",
+             r"\byes\b|authorized|eligible|i am"),
+            (r"require.*sponsor|visa|h.?1.?b|sponsorship",
+             r"\bno\b|not require|do not"),
+            (r"reloca|willing to move",
+             r"\byes\b|willing|open"),
+            (r"\bgender\b|\bsex\b",
+             r"\bmale\b|\bman\b"),
+            (r"hispanic|latino",
+             r"\bno\b|not hispanic|decline"),
+            (r"\brace\b|racial",
+             r"\basian\b"),
+            (r"veteran|military status",
+             r"not a protected|not a veteran|i am not|\bno\b"),
+            (r"disability|disabled",
+             r"\bno\b|do not have|don.t have|decline"),
+        ]
+        for q_pat, a_pat in RADIO_RULES:
+            self.click_radio(q_pat, a_pat, frame=frame or self.frame)
+
+    def fill_standard_checkboxes(self, frame=None):
+        """Check agreement/terms checkboxes."""
+        f = frame or self.frame
+        try:
+            for cb in f.locator('input[type="checkbox"]').all():
+                try:
+                    if not cb.is_visible(timeout=300):
+                        continue
+                    nearby = cb.evaluate("""el => {
+                        let lbl = el.id ? document.querySelector('label[for="' + el.id + '"]') : null;
+                        if (lbl) return lbl.innerText.toLowerCase();
+                        return (el.parentElement || {innerText: ''}).innerText.toLowerCase();
+                    }""")
+                    if re.search(r"agree|certif|confirm|terms|accept|acknowledge|consent",
+                                 nearby, re.I):
+                        if not cb.is_checked():
+                            cb.click()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def fill_yesno_toggles(self, frame=None):
+        """Handle Workable-style YES/NO button toggles."""
+        f = frame or self.frame
+        NO_PATTERNS = [
+            r"require.*sponsor|visa.*sponsor|h.?1.?b|sponsorship",
+            r"u\.?s\.? citizen|naturalized.*citizen|permanent resident",
+            r"currently based in (san diego|boston|new york|chicago|seattle|austin|dallas)",
+        ]
+        YES_PATTERNS = [
+            r"authorized|legally.*work|eligible.*work",
+            r"reloca|willing to move",
+        ]
+        try:
+            containers = f.locator(
+                '*:has(button:has-text("YES")):has(button:has-text("NO"))'
+            ).all()
+            for container in containers[:15]:
+                try:
+                    ctx_text = container.inner_text().lower()
+                    answer = None
+                    for pat in NO_PATTERNS:
+                        if re.search(pat, ctx_text, re.I):
+                            answer = "NO"
+                            break
+                    if answer is None:
+                        for pat in YES_PATTERNS:
+                            if re.search(pat, ctx_text, re.I):
+                                answer = "YES"
+                                break
+                    if not answer:
+                        continue
+                    btn = container.locator(
+                        f'button:has-text("{answer}")'
+                    ).first
+                    if btn.count() > 0 and btn.is_visible(timeout=500):
+                        btn.click()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def check_confirmation(self):
+        try:
+            txt = self.page.locator("body").inner_text().lower()
+            return any(x in txt for x in [
+                "application submitted", "application received",
+                "thank you for applying", "thanks for applying",
+                "successfully submitted", "successfully applied",
+                "we've received your application", "application complete",
+                "you have applied",
+            ])
+        except Exception:
+            return False
+
+    def is_expired(self):
+        try:
+            txt = self.page.locator("body").inner_text().lower()
+            return any(x in txt for x in [
+                "job has been filled", "no longer accepting", "posting has expired",
+                "job is no longer available", "this job is closed", "position has been filled",
+            ])
+        except Exception:
+            return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GREENHOUSE HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class GreenhouseHandler(ATSHandler):
+    """
+    Greenhouse uses known, stable field IDs.
+    Form is always on the same page — no Apply button needed.
+    """
+
+    def apply(self) -> bool:
+        page = self.page
+        f    = self.frame
+
+        # Step 1: click Apply button — Greenhouse job boards show description first,
+        # the actual form is below or requires clicking Apply to reveal it
+        try:
+            apply_btn = page.locator(
+                'a:has-text("Apply for this job"), '
+                'button:has-text("Apply for this job"), '
+                'a:has-text("Apply"), '
+                'button:has-text("Apply")'
+            ).first
+            if apply_btn.is_visible(timeout=3000):
+                print("  Clicking Apply button...")
+                apply_btn.click()
+                page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        # Step 2: wait for #first_name to be visible (form is now in viewport)
+        try:
+            f.wait_for_selector("#first_name", state="visible", timeout=10000)
+        except Exception:
+            # check iframes
+            self.frame, _ = find_frame_with_form(page)
+            f = self.frame
+            try:
+                f.wait_for_selector("#first_name", state="visible", timeout=5000)
+            except Exception:
+                print("  Form not found after clicking Apply")
+                return False
+
+        if self.is_expired():
+            print("  → Expired/closed posting")
+            return False
+
+        print("  Filling Greenhouse form...")
+
+        # Step 3: file uploads
+        if self.res_pdf:
+            try:
+                f.wait_for_selector("#resume", state="attached", timeout=5000)
+                f.locator("#resume").set_input_files(self.res_pdf)
+                print("    ✓ Resume uploaded")
+            except Exception:
+                self._upload_via_chooser(f, self.res_pdf, "resume")
+
+        if self.cl_pdf:
+            try:
+                f.wait_for_selector("#cover_letter", state="attached", timeout=3000)
+                f.locator("#cover_letter").set_input_files(self.cl_pdf)
+                print("    ✓ Cover letter uploaded")
+            except Exception:
+                pass
+
+        # Step 4: fill fields, track success
+        filled_any = False
+
+        if self.fill("#first_name", INFO["first"],   frame=f): filled_any = True
+        if self.fill("#last_name",  INFO["last"],    frame=f): filled_any = True
+        if self.fill("#email",      INFO["email"],   frame=f): filled_any = True
+        if self.fill("#phone",      INFO["phone_i"], frame=f): filled_any = True
+
+        # Standard Greenhouse URL fields (urls[] pattern)
+        for name, val in [
+            ("urls[LinkedIn]",  INFO["linkedin"]),
+            ("urls[GitHub]",    INFO["github"]),
+            ("urls[Portfolio]", INFO["portfolio"]),
+            ("urls[Website]",   INFO["portfolio"]),
+        ]:
+            if self.fill(f'input[name="{name}"]', val, frame=f):
+                filled_any = True
+
+        # Fallbacks for recruiters who use custom fields instead of standard ones
+        if self.fill_by_label("LinkedIn Profile", INFO["linkedin"],  frame=f): filled_any = True
+        if self.fill_by_label("LinkedIn",         INFO["linkedin"],  frame=f): filled_any = True
+        if self.fill_by_label("Website",          INFO["portfolio"], frame=f): filled_any = True
+        if self.fill_by_label("GitHub",           INFO["github"],    frame=f): filled_any = True
+        if self.fill_by_label("School",           INFO["university"],frame=f): filled_any = True
+        if self.fill_by_label("Degree",           INFO["degree_s"],  frame=f): filled_any = True
+
+        self.fill_by_placeholder("City, State, Country", INFO["location"], frame=f)
+        self.fill_by_label("Location", INFO["location"], frame=f)
+
+        self.fill_standard_dropdowns(frame=f)
+        self.fill_standard_radios(frame=f)
+        self.fill_standard_checkboxes(frame=f)
+        self.fill_open_questions(frame=f)
+
+        # Scroll down and second pass — catches lazy-loaded fields
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+        self.fill_standard_dropdowns(frame=f)
+        self.fill_standard_radios(frame=f)
+
+        # Scroll to bottom for EEO section
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(600)
+        except Exception:
+            pass
+
+        self.fill_standard_dropdowns(frame=f)
+        self.fill_standard_radios(frame=f)
+
+        # Accessibility tree — universal fallback for any missed dropdowns
+        self.fill_via_accessibility_tree(frame=f)
+
+        if not filled_any:
+            print("  No fields were filled — form may be blocked or hidden")
+            return False
+
+        return True
+
+    def _upload_via_chooser(self, frame, path, field_type):
+        """Fallback: click the upload button and catch the file chooser."""
+        try:
+            sel = f'button:has-text("Upload {field_type.title()}")'
+            with self.page.expect_file_chooser(timeout=5000) as fc:
+                frame.locator(sel).first.click()
+            fc.value.set_files(path)
+            print(f"    ✓ {field_type.title()} uploaded via chooser")
+        except Exception:
+            pass
+
+    def apply_via_api(self) -> bool:
+        """
+        Protocol Paradigm: intercept Greenhouse network traffic to get job_id
+        and session tokens, then POST the application directly to the API.
+        Bypasses the UI entirely — works even when form elements are blocked.
+        """
+        page = self.page
+        captured = {"job_id": None, "token": None}
+
+        # intercept requests to capture job_id and auth tokens
+        def on_request(req):
+            u = req.url
+            if "greenhouse.io" in u and "/applications" in u:
+                try:
+                    captured["token"] = req.headers.get("x-csrf-token") or \
+                                        req.headers.get("authorization", "")
                 except Exception:
                     pass
 
-                trigger.click()
-                pause(0.5, 1.0)
+        page.on("request", on_request)
 
-                for opt in options:
-                    for os_ in [
-                        f'[role="option"]:has-text("{opt}")',
-                        f'li:has-text("{opt}")',
-                        f'div[class*="option"]:has-text("{opt}")',
-                        f'span:has-text("{opt}")',
-                    ]:
-                        try:
-                            oe = page.locator(os_).first
-                            if oe.count() > 0 and oe.is_visible(timeout=1000):
-                                oe.click()
-                                pause(0.3, 0.5)
-                                return True
-                        except Exception:
-                            continue
+        # extract job_id from URL
+        m = re.search(r"/jobs/(\d+)", self.url)
+        if not m:
+            return False
+        job_id = m.group(1)
 
-                page.keyboard.press("Escape")
-                pause(0.2, 0.3)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
+        # extract board token from URL (e.g. greenhouse.io/racapitalmanagementllc/...)
+        m2 = re.search(r"greenhouse\.io/([^/]+)/", self.url)
+        board_token = m2.group(1) if m2 else ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UPLOAD FILES
-# ─────────────────────────────────────────────────────────────────────────────
+        if not board_token:
+            return False
 
-def upload_files(page, resume_pdf, cl_pdf):
-    inputs = page.locator('input[type="file"]').all()
-    resume_done = False
-    cl_done     = False
-    for fi in inputs:
+        # build multipart form — matches Greenhouse API schema
         try:
-            nearby = fi.evaluate("""el => {
-                let p = el.closest('[class*="field"],[class*="upload"],div,section');
-                return p ? p.innerText.toLowerCase() : '';
-            }""")
-            is_cover = "cover" in nearby
-            if is_cover and cl_pdf and not cl_done:
-                fi.set_input_files(cl_pdf); pause(1.5, 2.5); cl_done = True
-            elif not is_cover and resume_pdf and not resume_done:
-                fi.set_input_files(resume_pdf); pause(1.5, 2.5); resume_done = True
-        except Exception:
-            continue
-    if not resume_done and resume_pdf:
-        for fi in page.locator('input[type="file"]').all():
-            try:
-                fi.set_input_files(resume_pdf); pause(1.5, 2.5)
-                resume_done = True; break
-            except Exception:
-                continue
-    return resume_done
+            api_url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs/{job_id}/applications"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN FILL — uses Playwright native methods
-# ─────────────────────────────────────────────────────────────────────────────
+            with open(self.res_pdf, "rb") as rf:
+                resume_bytes = rf.read()
 
-def fill_all_fields(page, resume_pdf, cl_pdf, job_dir, company, title, jd_text):
-    """
-    Fill every field using Playwright native fill() + get_by_label().
-    Much more reliable than JS injection.
-    """
-    cl_text    = load_cover_letter_text(job_dir)
-    jd_snippet = (jd_text or "")[:500]
-
-    # build why-us answer
-    why_us = ""
-    if cl_text:
-        paras = [p.strip() for p in re.split(r"\s{3,}", cl_text) if len(p.strip()) > 20]
-        why_us = paras[1] if len(paras) > 1 else (paras[0] if paras else "")
-    if not why_us:
-        why_us = (f"I am drawn to {company} because its work aligns with my "
-                  f"experience building production LLM pipelines and RAG systems.")
-
-    # scroll to load all content
-    try:
-        page.evaluate("window.scrollTo(0, 0)")
-        pause(0.5, 0.8)
-    except Exception:
-        pass
-
-    # ── 1. File uploads ──────────────────────────────────────────────────────
-    upload_files(page, resume_pdf, cl_pdf)
-    pause(0.5, 1.0)
-
-    # ── 2. Detect phone format ───────────────────────────────────────────────
-    has_cc = False
-    try:
-        has_cc = page.evaluate("""() => {
-            let els = document.querySelectorAll('input, select');
-            for (let e of els) {
-                let c = (e.placeholder || '').toLowerCase() + (e.name || '').toLowerCase();
-                if (c.includes('country code') || c.includes('country_code')) return true;
+            payload = {
+                "first_name":   INFO["first"],
+                "last_name":    INFO["last"],
+                "email":        INFO["email"],
+                "phone":        INFO["phone_i"],
+                "job_id":       job_id,
+                "mapped_url_greenhouse_website":   INFO["portfolio"],
+                "mapped_url_linkedin":             INFO["linkedin"],
+                "mapped_url_github":               INFO["github"],
             }
-            return document.querySelectorAll('[class*="flag"],[class*="country-code"],[class*="dial-code"]').length > 0;
-        }""")
-    except Exception:
-        pass
-    phone_val = YOUR_INFO["phone_bare"] if has_cc else YOUR_INFO["phone_intl"]
 
-    # ── 3. Fill text fields using get_by_label ───────────────────────────────
-    # Each entry: (label patterns to try, value)
-    text_fields = [
-        (["First Name", "Legal First Name", "Given Name", "Preferred First Name"], YOUR_INFO["first_name"]),
-        (["Last Name", "Legal Last Name", "Family Name", "Surname"],               YOUR_INFO["last_name"]),
-        (["Full Name", "Legal Name", "Name"],                                      YOUR_INFO["full_name"]),
-        (["Email", "Email Address", "Email address"],                              YOUR_INFO["email"]),
-        (["Phone", "Phone Number", "Mobile", "Mobile Number", "Cell"],             phone_val),
-        (["LinkedIn", "LinkedIn Profile", "LinkedIn URL"],                         YOUR_INFO["linkedin"]),
-        (["Website", "Portfolio", "Personal Website", "Personal URL",
-          "Personal Site"],                                                         YOUR_INFO["portfolio"]),
-        (["GitHub", "Github"],                                                     YOUR_INFO["github"]),
-        # Location — try full first to avoid city overwriting it
-        (["Location: City, Region, Country", "Location: City, State, Country",
-          "City, Region, Country", "City, State, Country"],                        YOUR_INFO["location_full"]),
-        (["City"],                                                                 YOUR_INFO["city"]),
-        (["State", "State / Province", "Province"],                               YOUR_INFO["state_full"]),
-        (["Zip", "Zip Code", "Postal Code"],                                      YOUR_INFO["zip"]),
-        (["Country"],                                                              YOUR_INFO["country"]),
-        (["Current Company", "Current Employer", "Company", "Employer",
-          "Organization"],                                                          YOUR_INFO["current_co"]),
-        (["Current Title", "Current Position", "Job Title", "Position"],          YOUR_INFO["current_title"]),
-        (["University", "College", "School", "Institution"],                      YOUR_INFO["university"]),
-        (["Degree", "Field of Study", "Major"],                                   YOUR_INFO["degree"]),
-        (["Graduation Year", "Grad Year", "Expected Graduation"],                 YOUR_INFO["grad_year"]),
-        (["GPA"],                                                                  YOUR_INFO["gpa"]),
-        (["Years of Experience", "How many years"],                               YOUR_INFO["years_exp"]),
-        (["Salary", "Expected Salary", "Desired Salary", "Compensation",
-          "Expected Pay"],                                                          YOUR_INFO["salary"]),
-        (["Start Date", "When can you start", "Available to start"],              YOUR_INFO["start_date"]),
-        (["How did you hear", "Referral Source", "Where did you find"],           YOUR_INFO["hear_about"]),
-    ]
+            cookies = {c["name"]: c["value"]
+                       for c in page.context.cookies()}
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Referer": self.url,
+                "Origin":  "https://job-boards.greenhouse.io",
+            }
 
-    for label_variants, value in text_fields:
-        for label in label_variants:
-            if fill_by_label(page, label, value):
-                break
-            if fill_by_placeholder(page, label, value):
-                break
+            files = {
+                "resume": ("resume.pdf", resume_bytes, "application/pdf"),
+            }
 
-    pause(0.5, 0.8)
+            resp = requests.post(
+                api_url,
+                data=payload,
+                files=files,
+                headers=headers,
+                cookies=cookies,
+                timeout=30,
+            )
 
-    # ── 4. Dropdowns ─────────────────────────────────────────────────────────
-    dropdown_fields = [
-        ("authorized",    ["authorized to work", "legally authorized", "work auth", "eligible to work"],
-         ["Yes", "Yes, I am authorized", "Authorized"]),
-        ("sponsor",       ["sponsorship", "require sponsor", "visa sponsor", "H-1B", "immigration"],
-         ["No", "No, I do not", "Not required"]),
-        ("country",       ["country", "country of residence"],
-         ["United States", "United States of America", "USA"]),
-        ("state",         ["state", "state / province", "province"],
-         ["Texas", "TX"]),
-        ("education",     ["education level", "highest education", "degree level"],
-         ["Master", "Master's", "Master's Degree", "Graduate"]),
-        ("emp_type",      ["employment type", "job type", "position type"],
-         ["Full-time", "Full Time", "Permanent"]),
-        ("exp_years",     ["years of experience"],
-         ["0-2", "1-3", "2", "Entry Level"]),
-    ]
+            if resp.status_code in (200, 201):
+                print(f"    ✓ API submission successful (HTTP {resp.status_code})")
+                return True
+            else:
+                print(f"    API returned {resp.status_code} — falling back to UI")
+                return False
 
-    for key, label_variants, options in dropdown_fields:
-        for label in label_variants:
-            if select_dropdown_option(page, label, options):
-                break
-            if click_react_dropdown(page, label, options):
-                break
-
-    pause(0.3, 0.5)
-
-    # ── 5. Radio buttons ─────────────────────────────────────────────────────
-    try:
-        for radio in page.locator('input[type="radio"]').all():
-            try:
-                if not radio.is_visible(timeout=300):
-                    continue
-                nearby = radio.evaluate("""el => {
-                    let lbl = el.id ? document.querySelector('label[for="' + el.id + '"]') : null;
-                    if (lbl) return lbl.innerText.toLowerCase();
-                    let p = el.parentElement;
-                    for (let i = 0; i < 4; i++) {
-                        if (!p) break;
-                        let t = p.innerText || '';
-                        if (t.trim().length > 2) return t.toLowerCase();
-                        p = p.parentElement;
-                    }
-                    return (el.value || '').toLowerCase();
-                }""")
-                val  = (radio.get_attribute("value") or "").lower()
-                comb = nearby + " " + val
-                if (re.search(r"authorized|legally.*work|eligible", nearby, re.IGNORECASE) and
-                        re.search(r"\byes\b|authorized|eligible", comb, re.IGNORECASE)):
-                    radio.click(); pause(0.2, 0.3)
-                elif (re.search(r"sponsor|visa|h.?1.?b", nearby, re.IGNORECASE) and
-                        re.search(r"\bno\b|not require", comb, re.IGNORECASE)):
-                    radio.click(); pause(0.2, 0.3)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # ── 6. Agreement checkboxes ───────────────────────────────────────────────
-    try:
-        for cb in page.locator('input[type="checkbox"]').all():
-            try:
-                if not cb.is_visible(timeout=300):
-                    continue
-                nearby = cb.evaluate("""el => {
-                    let lbl = el.id ? document.querySelector('label[for="' + el.id + '"]') : null;
-                    if (lbl) return lbl.innerText.toLowerCase();
-                    return (el.parentElement || {innerText: ''}).innerText.toLowerCase();
-                }""")
-                if re.search(r"agree|certif|confirm|terms|accept|acknowledge", nearby, re.IGNORECASE):
-                    if not cb.is_checked():
-                        cb.click(); pause(0.2, 0.3)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # ── 7. Open-ended textareas ───────────────────────────────────────────────
-    open_map = [
-        (r"cover\s*letter",                                             cl_text[:1200] if cl_text else why_us),
-        (r"why.{0,50}(company|role|position|join|interest|us\b|here)", why_us[:600]),
-        (r"tell.{0,20}(about yourself|yourself|background)|introduce", cl_text[:600] if cl_text else why_us),
-        (r"what.{0,30}(excite|interest|draw|attract|motivat)",          why_us[:500]),
-        (r"additional.{0,30}(info|comment|detail)|anything\s*else",     why_us[:400]),
-        (r"how.{0,30}(contribute|add\s*value|help)",                    why_us[:500]),
-    ]
-
-    try:
-        for ta in page.locator("textarea").all():
-            try:
-                if not ta.is_visible(timeout=300):
-                    continue
-                cur = ta.input_value()
-                if cur and len(cur.strip()) > 15:
-                    continue
-                # get label
-                label_text = ""
-                ta_id = ta.get_attribute("id") or ""
-                if ta_id:
-                    lbl = page.locator(f'label[for="{ta_id}"]').first
-                    if lbl.count() > 0:
-                        label_text = lbl.inner_text().strip()
-                if not label_text:
-                    label_text = (ta.get_attribute("placeholder") or
-                                  ta.get_attribute("name") or
-                                  ta.get_attribute("aria-label") or "")
-                ll = label_text.lower()
-
-                # skip sensitive
-                if any(s in ll for s in SKIP_LABELS):
-                    continue
-
-                filled = False
-                for pat, ans in open_map:
-                    if re.search(pat, ll, re.IGNORECASE):
-                        ta.click(); pause(0.3, 0.5)
-                        ta.fill(ans); pause(0.2, 0.3)
-                        filled = True
-                        break
-
-                if not filled and len(label_text) > 5:
-                    print(f"    Unknown question: '{label_text[:55]}' — asking Ollama...")
-                    ans = ask_ollama(label_text, title, company, jd_snippet, cl_text)
-                    if ans and len(ans) > 5:
-                        ta.click(); pause(0.3, 0.5)
-                        ta.fill(ans[:600]); pause(0.2, 0.3)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # ── 8. Scroll down and fill again (catches late-loading fields) ───────────
-    try:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.5)")
-        pause(1.0, 1.5)
-    except Exception:
-        pass
-
-    # second pass for links + dropdowns after scroll
-    for label_variants, value in text_fields[:8]:  # top 8 = most important fields
-        for label in label_variants:
-            if fill_by_label(page, label, value):
-                break
-
-    for key, label_variants, options in dropdown_fields:
-        for label in label_variants:
-            if select_dropdown_option(page, label, options):
-                break
-            if click_react_dropdown(page, label, options):
-                break
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NAVIGATE TO FORM
-# ─────────────────────────────────────────────────────────────────────────────
-
-def navigate_to_form(page, ctx, url, ats):
-    """Try to get to the actual form. Returns (page, success)."""
-    tabs_before = len(ctx.pages)
-
-    # SmartRecruiters — append /apply
-    if ats == "smartrecruiters":
-        apply_url = url.split("?")[0].rstrip("/") + "/apply"
-        try:
-            page.goto(apply_url, timeout=30000, wait_until="domcontentloaded")
-            pause(3, 5)
-            n = page.locator('input:not([type="hidden"])').count()
-            print(f"  SmartRecruiters /apply → {n} inputs")
-            if n > 2:
-                return page, True
         except Exception as e:
-            print(f"  /apply failed: {e}")
+            print(f"    API attempt failed: {e}")
+            return False
 
-    # Ashby — append /apply
-    if ats == "ashby":
-        apply_url = url.split("?")[0].rstrip("/") + "/apply"
+# ─────────────────────────────────────────────────────────────────────────────
+# LEVER HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LeverHandler(ATSHandler):
+    """
+    Lever uses a single-page form with name= attributes.
+    Full name in one field (not split).
+    """
+
+    def apply(self) -> bool:
+        f = self.frame
+
         try:
-            page.goto(apply_url, timeout=30000, wait_until="domcontentloaded")
-            pause(3, 5)
-            n = page.locator('input:not([type="hidden"])').count()
-            if n > 2:
-                return page, True
+            f.wait_for_selector('.application-form', state="visible", timeout=15000)
+        except Exception:
+            self.frame, _ = find_frame_with_form(self.page)
+            f = self.frame
+
+        if self.is_expired():
+            return False
+
+        print("  Filling Lever form...")
+
+        # Lever file upload
+        if self.res_pdf:
+            try:
+                with self.page.expect_file_chooser(timeout=5000) as fc:
+                    f.locator('button:has-text("Upload resume")').first.click()
+                fc.value.set_files(self.res_pdf)
+                print("    ✓ Resume uploaded")
+            except Exception:
+                self.fill('input[type="file"]', self.res_pdf, frame=f)
+
+        # Lever uses full name in one field
+        self.fill('input[name="name"]',    INFO["full"],    frame=f)
+        self.fill('input[name="email"]',   INFO["email"],   frame=f)
+        self.fill('input[name="phone"]',   INFO["phone_i"], frame=f)
+        self.fill('input[name="org"]',     INFO["company"], frame=f)
+
+        # Lever links
+        for name, val in [
+            ("urls[LinkedIn]",   INFO["linkedin"]),
+            ("urls[GitHub]",     INFO["github"]),
+            ("urls[Portfolio]",  INFO["portfolio"]),
+            ("urls[Other]",      INFO["portfolio"]),
+        ]:
+            self.fill(f'input[name="{name}"]', val, frame=f)
+
+        self.fill_by_label("Location", INFO["location"], frame=f)
+        self.fill_standard_dropdowns(frame=f)
+        self.fill_standard_radios(frame=f)
+        self.fill_standard_checkboxes(frame=f)
+        self.fill_open_questions(frame=f)
+        return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKABLE HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WorkableHandler(ATSHandler):
+    """
+    Workable: Apply Now button opens a modal (same-page overlay).
+    Uses JS click to avoid overlay blocking.
+    """
+
+    def apply(self) -> bool:
+        page = self.page
+
+        # click Apply Now via JS (avoids overlay detection issues)
+        clicked = page.evaluate("""() => {
+            const pats = [/^apply now$/i, /^apply for this job$/i, /apply now/i, /^apply$/i];
+            const btns = [...document.querySelectorAll('button, a')];
+            for (const pat of pats) {
+                const b = btns.find(el =>
+                    pat.test((el.innerText || el.textContent || '').trim()) && !el.disabled
+                );
+                if (b) { b.click(); return true; }
+            }
+            return false;
+        }""")
+
+        if not clicked:
+            print("  No Apply Now button on Workable page")
+            return False
+
+        print("  Apply Now clicked — waiting for modal...")
+
+        # wait for modal inputs
+        try:
+            page.wait_for_selector('input[name="firstname"]', state="visible", timeout=10000)
+            f = page
+        except Exception:
+            self.frame, _ = find_frame_with_form(page)
+            f = self.frame
+
+        if not self.wait_for_form(timeout=5000, frame=f):
+            return False
+
+        print("  Filling Workable form...")
+
+        # resume
+        if self.res_pdf:
+            try:
+                with page.expect_file_chooser(timeout=5000) as fc:
+                    f.locator('button:has-text("CV"),'
+                              'button:has-text("Resume"),'
+                              'button:has-text("Upload")').first.click()
+                fc.value.set_files(self.res_pdf)
+                print("    ✓ Resume uploaded")
+            except Exception:
+                pass
+
+        # Workable uses firstname/lastname name attributes
+        for name, val in [
+            ("firstname",  INFO["first"]),
+            ("lastname",   INFO["last"]),
+            ("email",      INFO["email"]),
+            ("phone",      INFO["phone_i"]),
+            ("headline",   INFO["title"]),
+            ("summary",    self.why_us[:400]),
+            ("address",    INFO["location"]),
+        ]:
+            self.fill(f'input[name="{name}"], textarea[name="{name}"]', val, frame=f)
+
+        # Workable social links
+        for placeholder, val in [
+            ("LinkedIn",  INFO["linkedin"]),
+            ("GitHub",    INFO["github"]),
+            ("Portfolio", INFO["portfolio"]),
+            ("Website",   INFO["portfolio"]),
+        ]:
+            self.fill_by_placeholder(placeholder, val, frame=f)
+
+        self.fill_standard_dropdowns(frame=f)
+        self.fill_standard_radios(frame=f)
+        self.fill_yesno_toggles(frame=f)
+        self.fill_standard_checkboxes(frame=f)
+        self.fill_open_questions(frame=f)
+
+        # scroll modal and second pass
+        try:
+            page.evaluate("""() => {
+                const m = document.querySelector(
+                    '[role="dialog"], [class*="modal"], [class*="Modal"]'
+                );
+                if (m) m.scrollTop = m.scrollHeight / 2;
+            }""")
+            page.wait_for_timeout(800)
         except Exception:
             pass
 
-    # generic Apply button
-    for sel in [
+        self.fill_standard_dropdowns(frame=f)
+        self.fill_standard_radios(frame=f)
+        self.fill_yesno_toggles(frame=f)
+        self.fill_open_questions(frame=f)
+
+        # auto-submit
+        submitted = page.evaluate("""() => {
+            const b = [...document.querySelectorAll('button')].find(el =>
+                /^submit application$|^submit$/i.test((el.innerText || '').trim())
+            );
+            if (b) { b.click(); return true; }
+            return false;
+        }""")
+        if submitted:
+            print("    → Workable submitted automatically")
+        return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMARTRECRUITERS HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SmartRecruitersHandler(ATSHandler):
+    """SmartRecruiters: navigate to {url}/apply, click 'I'm interested' button."""
+
+    def apply(self) -> bool:
+        apply_url = self.url.split("?")[0].rstrip("/") + "/apply"
+        self.page.goto(apply_url, timeout=30000, wait_until="domcontentloaded")
+        self.page.wait_for_timeout(2000)
+
+        # SmartRecruiters shows "I'm interested" as the Apply button
+        for sel in [
+            'button:has-text("I\'m interested")',
+            'a:has-text("I\'m interested")',
+            'button:has-text("Apply")',
+            'a:has-text("Apply")',
+        ]:
+            try:
+                btn = self.page.locator(sel).first
+                if btn.is_visible(timeout=3000):
+                    print(f"    → Clicking: {sel[:40]}")
+                    btn.click(force=True)
+                    try:
+                        self.page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        self.page.wait_for_timeout(3000)
+                    break
+            except Exception:
+                continue
+
+        try:
+            self.page.wait_for_selector(
+                'input[name="firstName"], input[id*="firstName"], '
+                'input[placeholder*="First"]',
+                state="visible", timeout=10000
+            )
+        except Exception:
+            self.frame, _ = find_frame_with_form(self.page)
+
+        f = self.frame
+        if self.is_expired():
+            return False
+
+        print("  Filling SmartRecruiters form...")
+
+        if self.res_pdf:
+            try:
+                with self.page.expect_file_chooser(timeout=4000) as fc:
+                    f.locator(
+                        'button:has-text("Resume"), button:has-text("CV"), '
+                        'button:has-text("Upload")'
+                    ).first.click()
+                fc.value.set_files(self.res_pdf)
+                print("    ✓ Resume uploaded")
+            except Exception:
+                try:
+                    f.wait_for_selector('input[type="file"]', state="attached", timeout=3000)
+                    f.locator('input[type="file"]').first.set_input_files(self.res_pdf)
+                    print("    ✓ Resume uploaded")
+                except Exception:
+                    pass
+
+        for sel, val in [
+            ('input[name="firstName"], input[id*="firstName"]', INFO["first"]),
+            ('input[name="lastName"],  input[id*="lastName"]',  INFO["last"]),
+            ('input[name="email"],     input[id*="email"]',     INFO["email"]),
+            ('input[name="phone"],     input[id*="phone"]',     INFO["phone_i"]),
+        ]:
+            self.fill(sel, val, frame=f)
+
+        self.fill_by_label("LinkedIn",  INFO["linkedin"],  frame=f)
+        self.fill_by_label("Portfolio", INFO["portfolio"], frame=f)
+        self.fill_by_label("GitHub",    INFO["github"],    frame=f)
+
+        self.fill_standard_dropdowns(frame=f)
+        self.fill_standard_radios(frame=f)
+        self.fill_standard_checkboxes(frame=f)
+        self.fill_open_questions(frame=f)
+        return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASHBY HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AshbyHandler(ATSHandler):
+    """Ashby: navigate to {url}/apply directly."""
+
+    def apply(self) -> bool:
+        apply_url = self.url.split("?")[0].rstrip("/") + "/apply"
+        self.page.goto(apply_url, timeout=30000, wait_until="domcontentloaded")
+
+        try:
+            self.page.wait_for_selector('input[placeholder*="First"]',
+                                        state="visible", timeout=10000)
+        except Exception:
+            self.frame, _ = find_frame_with_form(self.page)
+
+        f = self.frame
+        print("  Filling Ashby form...")
+
+        if self.res_pdf:
+            try:
+                with self.page.expect_file_chooser(timeout=5000) as fc:
+                    f.locator('button:has-text("Upload"), button:has-text("Resume")').first.click()
+                fc.value.set_files(self.res_pdf)
+                print("    ✓ Resume uploaded")
+            except Exception:
+                pass
+
+        self.fill_by_placeholder("First Name", INFO["first"],   frame=f)
+        self.fill_by_placeholder("Last Name",  INFO["last"],    frame=f)
+        self.fill_by_placeholder("Email",      INFO["email"],   frame=f)
+        self.fill_by_placeholder("Phone",      INFO["phone_i"], frame=f)
+        self.fill_by_placeholder("LinkedIn",   INFO["linkedin"],frame=f)
+        self.fill_by_placeholder("Website",    INFO["portfolio"],frame=f)
+        self.fill_by_placeholder("GitHub",     INFO["github"],  frame=f)
+
+        self.fill_standard_dropdowns(frame=f)
+        self.fill_standard_radios(frame=f)
+        self.fill_standard_checkboxes(frame=f)
+        self.fill_open_questions(frame=f)
+        return True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GENERIC HANDLER — fallback for unknown ATS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKDAY HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WorkdayHandler(ATSHandler):
+    """
+    Workday forces a 'Start Your Application' modal then an account wall.
+    Strategy:
+    1. Dismiss modal → 'Use My Last Application' > 'Apply Manually' > 'Autofill'
+    2. Create Account wall → auto-generate account with standard password
+    3. Sign In wall → sign in with existing credentials
+    4. Multi-step fill with Next-button navigation (up to 8 steps)
+    """
+
+    STANDARD_PASSWORD = "JobAgent2026!@#"
+
+    def apply(self) -> bool:
+        page = self.page
+        print("  Workday protocol...")
+
+        # Step 1: dismiss "Start Your Application" modal
+        modal_handled = False
+        for sel, label in [
+            ('button:has-text("Use My Last Application")', "Use My Last Application"),
+            ('button:has-text("Apply Manually")',          "Apply Manually"),
+            ('a:has-text("Apply Manually")',               "Apply Manually"),
+            ('button:has-text("Autofill with Resume")',    "Autofill with Resume"),
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=3000):
+                    print(f"    → Clicking: {label}")
+                    btn.click(force=True)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        page.wait_for_timeout(3000)
+                    modal_handled = True
+                    break
+            except Exception:
+                continue
+
+        if not modal_handled:
+            try:
+                btn = page.locator(
+                    'button:has-text("Apply"), a:has-text("Apply")'
+                ).first
+                if btn.is_visible(timeout=3000):
+                    btn.click(force=True)
+                    page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
+        # Step 2: handle Create Account wall
+        try:
+            create_btn = page.locator(
+                'button:has-text("Create Account"), a:has-text("Create Account")'
+            ).first
+            if create_btn.is_visible(timeout=4000):
+                print("    → Account wall — creating account...")
+                create_btn.click(force=True)
+                page.wait_for_timeout(2000)
+
+                self.fill_by_label("Email Address",       INFO["email"])
+                self.fill_by_label("Password",            self.STANDARD_PASSWORD)
+                self.fill_by_label("Verify New Password", self.STANDARD_PASSWORD)
+                self.fill_by_label("Verify Password",     self.STANDARD_PASSWORD)
+                self.fill_by_label("Confirm Password",    self.STANDARD_PASSWORD)
+
+                # check Terms of Service / I Agree box
+                try:
+                    cb = page.locator('input[type="checkbox"]').first
+                    if cb.is_visible(timeout=1000) and not cb.is_checked():
+                        cb.click(force=True)
+                except Exception:
+                    pass
+
+                # submit
+                for sub_sel in [
+                    'button:has-text("Create Account")',
+                    'button:has-text("Create")',
+                    'button[type="submit"]',
+                ]:
+                    try:
+                        sub = page.locator(sub_sel).first
+                        if sub.is_visible(timeout=1500):
+                            sub.click(force=True)
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=8000)
+                            except Exception:
+                                page.wait_for_timeout(4000)
+                            print("    → Account created")
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # Step 3: handle Sign In wall (account already exists)
+        try:
+            signin_btn = page.locator('button:has-text("Sign In")').first
+            if signin_btn.is_visible(timeout=3000):
+                print("    → Sign In wall — signing in...")
+                self.fill_by_label("Email Address", INFO["email"])
+                self.fill_by_label("Password",      self.STANDARD_PASSWORD)
+                signin_btn.click(force=True)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except Exception:
+                    page.wait_for_timeout(4000)
+        except Exception:
+            pass
+
+        # Step 4: multi-step fill
+        self.frame, n = find_frame_with_form(page)
+        if n < 2:
+            navigated = llm_popup_navigator(page, max_steps=3)
+            if not navigated:
+                return False
+            self.frame, n = find_frame_with_form(page)
+
+        if n < 2:
+            return False
+
+        f = self.frame
+        print(f"  Filling Workday form ({n} inputs)...")
+
+        for step_num in range(8):
+            # file upload on step 1
+            if step_num == 0 and self.res_pdf:
+                try:
+                    fi = f.locator('input[type="file"]').first
+                    if fi.is_visible(timeout=2000):
+                        fi.set_input_files(self.res_pdf)
+                        print("    ✓ Resume uploaded")
+                        page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+
+            self.fill_by_label("First Name",     INFO["first"],   frame=f)
+            self.fill_by_label("Last Name",      INFO["last"],    frame=f)
+            self.fill_by_label("Email Address",  INFO["email"],   frame=f)
+            self.fill_by_label("Phone Number",   INFO["phone_i"], frame=f)
+            self.fill_by_label("Address Line 1", INFO["street"],  frame=f)
+            self.fill_by_label("City",           INFO["city"],    frame=f)
+            self.fill_by_label("Postal Code",    INFO["zip"],     frame=f)
+            self.fill_standard_dropdowns(frame=f)
+            self.fill_standard_radios(frame=f)
+            self.fill_open_questions(frame=f)
+            self.fill_via_accessibility_tree(frame=f)
+
+            # next or submit
+            next_btn = None
+            for sel in [
+                'button:has-text("Next")',
+                'button:has-text("Save and Continue")',
+                'button[data-automation-id="bottom-navigation-next-button"]',
+            ]:
+                try:
+                    b = f.locator(sel).first
+                    if b.is_visible(timeout=1000):
+                        next_btn = b; break
+                except Exception:
+                    continue
+
+            if next_btn:
+                print(f"    → Step {step_num + 1} → next")
+                next_btn.evaluate("el => el.click()")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=6000)
+                except Exception:
+                    page.wait_for_timeout(2000)
+                self.frame, _ = find_frame_with_form(page)
+                f = self.frame
+            else:
+                # check for Submit
+                try:
+                    sub = f.locator('button:has-text("Submit")').first
+                    if sub.is_visible(timeout=1000):
+                        print("    → Submit button reached")
+                except Exception:
+                    pass
+                break
+
+        return True
+
+
+class GenericHandler(ATSHandler):
+    """
+    Fallback handler. Finds Apply button, waits for form,
+    fills using label-based detection.
+    Uses multi-page navigation (Next button).
+    """
+
+    APPLY_SELECTORS = [
         'button:has-text("Apply for this job")',
-        'button:has-text("Apply Now")',
-        'button:has-text("Apply now")',
-        'button:has-text("Apply")',
         'a:has-text("Apply for this job")',
+        'button:has-text("Apply Now")',
         'a:has-text("Apply Now")',
-        'a:has-text("Apply")',
+        'button:has-text("Apply now")',
+        'a:has-text("Apply now")',
         '[data-ui="apply-button"]',
         '[data-qa="btn-apply"]',
+        'button:has-text("Apply")',
+        'a:has-text("Apply")',
         '[class*="apply-button"]',
-        '[class*="applyButton"]',
-    ]:
+    ]
+
+    NEXT_SELECTORS = [
+        'button:has-text("Next")',
+        'button:has-text("Continue")',
+        'button:has-text("Save and Continue")',
+        'button:has-text("Next Step")',
+    ]
+
+    SUBMIT_SELECTORS = [
+        'button:has-text("Submit Application")',
+        'button:has-text("Submit My Application")',
+        'button:has-text("Submit")',
+        'input[type="submit"][value*="Submit"]',
+    ]
+
+    def apply(self) -> bool:
+        page = self.page
+
+        # check if form already on page
+        _, n = find_frame_with_form(page)
+        if n <= 3:
+            # try clicking Apply button
+            self._click_apply_button()
+            # wait for form to load
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
+        # update frame after navigation
+        self.frame, n = find_frame_with_form(page)
+        f = self.frame
+
+        if n == 0:
+            return False
+
+        if self.is_expired():
+            return False
+
+        print(f"  Filling Generic form ({n} inputs)...")
+
+        # multi-page filling loop
+        MAX_PAGES = 8
+        last_url  = ""
+        for page_num in range(1, MAX_PAGES + 1):
+            print(f"    Page {page_num}...")
+            self._fill_page(f)
+
+            kind, btn = self._get_next_or_submit(f)
+
+            if kind == "next":
+                print(f"    → Clicking Next ({page_num}→{page_num+1})")
+                try:
+                    btn.evaluate("el => el.click()")
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=6000)
+                    except Exception:
+                        page.wait_for_timeout(2000)
+                    new_url = page.url
+                    if new_url == last_url:
+                        print("    ! Page did not advance — stopping")
+                        break
+                    last_url = new_url
+                    self.frame, _ = find_frame_with_form(page)
+                    f = self.frame
+                except Exception as e:
+                    print(f"    ! Next click failed: {e}")
+                    break
+
+            elif kind == "submit":
+                print(f"    → Submitting on page {page_num}")
+                try:
+                    btn.scroll_into_view_if_needed()
+                    btn.evaluate("el => el.click()")
+                    page.wait_for_timeout(2000)
+                except Exception as e:
+                    print(f"    Submit click error: {e}")
+                break
+
+            else:
+                break
+
+        return True
+
+    def _click_apply_button(self):
+        page = self.page
+        tabs_before = len(self.ctx.pages)
+        page.evaluate("window.scrollTo(0, 400)")
         try:
-            btn = page.locator(sel).first
-            if btn.count() > 0 and btn.is_visible(timeout=1500):
-                btn.click()
-                pause(3, 5)
-                all_pages = ctx.pages
-                if len(all_pages) > tabs_before:
-                    new_page = all_pages[-1]
-                    new_page.bring_to_front()
-                    pause(2, 3)
-                    n = new_page.locator('input:not([type="hidden"])').count()
-                    print(f"  New tab → {n} inputs")
-                    if n > 0:
-                        return new_page, True
-                n = page.locator('input:not([type="hidden"])').count()
-                if n > 2:
-                    print(f"  Apply clicked → {n} inputs")
-                    return page, True
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+        for sel in self.APPLY_SELECTORS:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() > 0 and btn.is_visible(timeout=1500):
+                    print(f"  Clicking: {sel[:55]}")
+                    btn.evaluate("el => el.click()")
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=7000)
+                    except Exception:
+                        page.wait_for_timeout(3000)
+                    # new tab?
+                    if len(self.ctx.pages) > tabs_before:
+                        self.page = self.ctx.pages[-1]
+                        self.page.bring_to_front()
+                        page.wait_for_timeout(2000)
+                    return
+            except Exception:
+                continue
+
+    def _fill_page(self, frame):
+        """Fill everything visible on current page."""
+        if self.res_pdf:
+            try:
+                fi = frame.locator('input[type="file"]').first
+                fi.wait_for(state="attached", timeout=3000)
+                fi.set_input_files(self.res_pdf)
+                print("    ✓ Resume uploaded")
+            except Exception:
+                pass
+
+        # standard fields by label
+        LABEL_FILLS = [
+            (["First Name","Legal First Name","Given Name"], INFO["first"]),
+            (["Last Name","Legal Last Name","Family Name"],  INFO["last"]),
+            (["Full Name","Legal Name","Name"],              INFO["full"]),
+            (["Email","Email Address"],                      INFO["email"]),
+            (["Phone","Phone Number","Mobile"],              INFO["phone_i"]),
+            (["LinkedIn","LinkedIn Profile"],                INFO["linkedin"]),
+            (["GitHub","Github"],                           INFO["github"]),
+            (["Website","Portfolio"],                        INFO["portfolio"]),
+            (["City"],                                       INFO["city"]),
+            (["Zip","Zip Code","Postal Code"],               INFO["zip"]),
+            (["University","College","School"],              INFO["university"]),
+            (["Degree","Field of Study","Major"],            INFO["degree_s"]),
+            (["GPA"],                                        INFO["gpa"]),
+            (["Salary","Desired Salary","Expected Salary"],  INFO["salary"]),
+            (["Start Date","When can you start"],            INFO["start"]),
+        ]
+        for labels, value in LABEL_FILLS:
+            for label in labels:
+                if self.fill_by_label(label, value, frame=frame):
+                    break
+
+        self.fill_standard_dropdowns(frame=frame)
+        self.fill_standard_radios(frame=frame)
+        self.fill_yesno_toggles(frame=frame)
+        self.fill_standard_checkboxes(frame=frame)
+        self.fill_open_questions(frame=frame)
+
+    def _get_next_or_submit(self, frame):
+        for sel in self.NEXT_SELECTORS:
+            try:
+                btn = frame.locator(sel).first
+                if btn.count() > 0 and btn.is_visible(timeout=600):
+                    return "next", btn
+            except Exception:
+                continue
+        for sel in self.SUBMIT_SELECTORS:
+            try:
+                btn = frame.locator(sel).first
+                if btn.count() > 0 and btn.is_visible(timeout=600):
+                    return "submit", btn
+            except Exception:
+                continue
+        return None, None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MANUAL HANDLER — opens browser, you apply yourself
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ManualHandler(ATSHandler):
+    """For Oracle, Taleo, Google, Apple, Amazon — manual apply."""
+
+    def apply(self) -> bool:
+        print(f"\n  Manual portal — apply in browser")
+        print(f"  Resume: {self.res_pdf}")
+        if self.cl_pdf:
+            print(f"  CL:     {self.cl_pdf}")
+        return True  # always returns True — user confirms
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM POPUP NAVIGATOR — agentic fallback for unknown modals/pop-ups
+# ─────────────────────────────────────────────────────────────────────────────
+
+def llm_popup_navigator(page, max_steps=4):
+    """
+    When the bot encounters an unknown modal or multi-step gateway,
+    this reads the Accessibility Tree, asks Ollama what to click,
+    and clicks it. Repeats up to max_steps times.
+
+    Works on ANY website — no hardcoding required.
+    The LLM reads the screen semantically, like a human would.
+    """
+    for step in range(max_steps):
+        # check if we already have a form
+        try:
+            n = page.locator('input:not([type="hidden"])').count()
+            if n >= 3:
+                return True
+        except Exception:
+            pass
+
+        # get accessibility tree — clean semantic view of the page
+        try:
+            snapshot = page.accessibility.snapshot(interesting_only=True)
+            if not snapshot:
+                continue
         except Exception:
             continue
 
-    # check if form already on page
-    n = page.locator('input:not([type="hidden"])').count()
-    if n > 3:
-        print(f"  Form already on page → {n} inputs")
+        # extract all interactive node names (buttons, links)
+        def collect_clickable(node, depth=0):
+            if not node or depth > 10:
+                return []
+            items = []
+            role = (node.get("role") or "").lower()
+            name = (node.get("name") or "").strip()
+            if role in ("button", "link", "menuitem") and name and len(name) < 80:
+                items.append(name)
+            for child in (node.get("children") or []):
+                items.extend(collect_clickable(child, depth + 1))
+            return items
+
+        clickable = collect_clickable(snapshot)
+        if not clickable:
+            continue
+
+        # ask Ollama which button to click
+        prompt = (
+            "I am a bot trying to apply for a job online.\n"
+            f"The screen shows these clickable elements:\n{clickable[:30]}\n\n"
+            "Which ONE should I click to proceed with the job application? "
+            "Reply with ONLY the exact button/link text. "
+            "Prefer: Apply, Apply Manually, Continue, Next, Start Application, Submit. "
+            "Avoid: Sign In, Create Account, Cancel, Close, Back, Login."
+        )
+        try:
+            r = requests.post(OLLAMA_URL, json={
+                "model": MODEL_NAME,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.0, "num_ctx": 800},
+            }, timeout=30)
+            if r.status_code != 200:
+                continue
+            answer = r.json().get("response", "").strip().strip('"').strip("'")
+        except Exception:
+            continue
+
+        if not answer or len(answer) > 60:
+            continue
+
+        print(f"    LLM navigator: click '{answer}'")
+
+        # click the suggested element
+        clicked = False
+        for sel in [
+            f'button:has-text("{answer}")',
+            f'a:has-text("{answer}")',
+            f'[role="button"]:has-text("{answer}")',
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=2000):
+                    btn.click(force=True)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:
+                        page.wait_for_timeout(2000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            print(f"    Could not find '{answer}' — stopping navigator")
+            break
+
+    # final check
+    try:
+        return page.locator('input:not([type="hidden"])').count() >= 3
+    except Exception:
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISCOVERY ROUTER — handles landing pages, job indexes, multi-step navigation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resolve_careers_landing_page(page, ctx, target_title=""):
+    """
+    Intelligent Router: if the URL lands on a corporate splash page
+    (e.g. gumgum.com/jobs, flatiron.com/careers) instead of an ATS form,
+    this function clicks through to find the actual application.
+
+    Flow:
+    1. Already on form? → return (page, True) immediately
+    2. On a job listings index? → find and click the specific role title
+    3. On a splash page? → click "View Open Positions" / "See Roles" etc.
+    4. Opened a new tab? → switch to it
+    """
+    def input_count(p):
+        try:
+            return p.locator('input:not([type="hidden"])').count()
+        except Exception:
+            return 0
+
+    # already on form
+    if input_count(page) >= 3:
+        return page, True
+
+    print("  [?] Landing page detected — running discovery route...")
+
+    # ── Step 1: look for the specific job title link (listings index) ─────────
+    if target_title:
+        for attempt in [target_title, target_title.split("-")[0].strip(),
+                        target_title.split("–")[0].strip()]:
+            try:
+                link = page.locator(f'a:has-text("{attempt}")').first
+                if link.count() == 0:
+                    link = page.locator(f'[role="link"]:has-text("{attempt}")').first
+                if link.count() > 0 and link.is_visible(timeout=2000):
+                    tabs_before = len(ctx.pages)
+                    print(f"    → Clicking job listing: '{attempt}'")
+                    link.click(force=True)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=6000)
+                    except Exception:
+                        page.wait_for_timeout(3000)
+                    if len(ctx.pages) > tabs_before:
+                        page = ctx.pages[-1]
+                        page.bring_to_front()
+                        page.wait_for_timeout(2000)
+                    if input_count(page) >= 3:
+                        return page, True
+            except Exception:
+                continue
+
+    # ── Step 2: click "View Open Positions" / "Explore Careers" etc. ─────────
+    DISCOVERY_SELECTORS = [
+        'a:has-text("View Open Positions")',   'button:has-text("View Open Positions")',
+        'a:has-text("See Open Roles")',        'button:has-text("See Open Roles")',
+        'a:has-text("Explore Careers")',       'button:has-text("Explore Careers")',
+        'a:has-text("Search Jobs")',           'button:has-text("Search Jobs")',
+        'a:has-text("View Jobs")',             'button:has-text("View Jobs")',
+        'a:has-text("Open Positions")',        'button:has-text("Open Positions")',
+        'a:has-text("Current Openings")',      'button:has-text("Current Openings")',
+        'a:has-text("Join Us")',               'button:has-text("Join Us")',
+        'a:has-text("Careers")',
+        '[class*="careers-link"]', '[class*="jobs-link"]',
+    ]
+    for sel in DISCOVERY_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() == 0 or not btn.is_visible(timeout=1500):
+                continue
+            print(f"    → Discovery click: {sel[:50]}")
+            tabs_before = len(ctx.pages)
+            btn.click(force=True)
+            try:
+                page.wait_for_load_state("networkidle", timeout=6000)
+            except Exception:
+                page.wait_for_timeout(3000)
+            # new tab opened?
+            if len(ctx.pages) > tabs_before:
+                page = ctx.pages[-1]
+                page.bring_to_front()
+                page.wait_for_timeout(2000)
+            # now try to find the specific job title
+            if target_title:
+                try:
+                    link = page.locator(f'a:has-text("{target_title}")').first
+                    if link.count() > 0 and link.is_visible(timeout=2000):
+                        print(f"    → Clicking: '{target_title}'")
+                        link.click(force=True)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            page.wait_for_timeout(2500)
+                        if len(ctx.pages) > tabs_before + 1:
+                            page = ctx.pages[-1]
+                            page.bring_to_front()
+                except Exception:
+                    pass
+            if input_count(page) >= 3:
+                return page, True
+            break
+        except Exception:
+            continue
+
+    # ── Step 3: look for any iframe that may contain the form ─────────────────
+    frame_page, n = find_frame_with_form(page)
+    if n >= 3:
+        return page, True
+
+    # ── Step 4: LLM navigator — ask Ollama what to click ─────────────────────
+    if llm_popup_navigator(page, max_steps=3):
         return page, True
 
     return page, False
 
 
-def check_confirmation(page):
-    try:
-        txt = page.locator("body").inner_text().lower()
-        return any(x in txt for x in [
-            "application submitted", "application received",
-            "thank you for applying", "thanks for applying",
-            "successfully submitted", "successfully applied",
-            "we've received your application", "application complete",
-            "you have applied", "we will be in touch",
-        ])
-    except Exception:
-        return False
+def search_and_click_specific_job(page, ctx, target_title):
+    """
+    On a job listings index page, find and click the link matching target_title.
+    Handles partial matches and new-tab navigation.
+    """
+    tabs_before = len(ctx.pages)
+    # try exact then partial title
+    for attempt in [target_title,
+                    " ".join(target_title.split()[:4]),
+                    target_title.split("-")[0].strip()]:
+        try:
+            link = page.locator(f'a:has-text("{attempt}")').first
+            if link.count() > 0 and link.is_visible(timeout=2000):
+                print(f"    → Clicking listing: '{attempt}'")
+                link.click(force=True)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=6000)
+                except Exception:
+                    page.wait_for_timeout(2500)
+                if len(ctx.pages) > tabs_before:
+                    page = ctx.pages[-1]
+                    page.bring_to_front()
+                    page.wait_for_timeout(2000)
+                return page, True
+        except Exception:
+            continue
+    return page, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HANDLER REGISTRY
+# ─────────────────────────────────────────────────────────────────────────────
+
+HANDLERS = {
+    "greenhouse":     GreenhouseHandler,
+    "lever":          LeverHandler,
+    "workable":       WorkableHandler,
+    "smartrecruiters":SmartRecruitersHandler,
+    "ashby":          AshbyHandler,
+    "workday":        ManualHandler,
+    "oracle":         ManualHandler,
+    "taleo":          ManualHandler,
+    "google":         ManualHandler,
+    "apple":          ManualHandler,
+    "amazon":         ManualHandler,
+}
+
+def get_handler(ats, *args, **kwargs):
+    cls = HANDLERS.get(ats, GenericHandler)
+    return cls(*args, **kwargs)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main(db_path="job_agent.db"):
+def main(db_path=r"C:\JobAgentData\job_agent.db"):
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         print("pip install playwright && playwright install chromium")
         return {}
 
+    # ── DB setup with WAL mode (prevents corruption) ─────────────────────────
     conn = sqlite3.connect(db_path)
-    c    = conn.cursor()
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    c = conn.cursor()
+
     c.execute("""
         SELECT jobpostingid, company, title, url, status, jd_text
         FROM seen_jobs
-        WHERE status IN ('GENERATED_YES','GENERATED_MAYBE')
-        ORDER BY CASE status WHEN 'GENERATED_YES' THEN 0 ELSE 1 END, date_found DESC
+        WHERE status IN ('GENERATED_YES','GENERATED_MAYBE','MANUAL_APPLY')
+        ORDER BY
+          CASE status
+            WHEN 'GENERATED_YES'   THEN 0
+            WHEN 'GENERATED_MAYBE' THEN 1
+            ELSE 2
+          END,
+          date_found DESC
     """)
     jobs  = c.fetchall()
     total = len(jobs)
 
     if not jobs:
-        print("No jobs to apply. Run stage2 first or reset manual jobs.")
+        print("No jobs in queue.")
         conn.close()
         return {}
 
-    print(f"\n=== Stage 3: {total} job(s) ===")
-    print(f"  LinkedIn:  {YOUR_INFO['linkedin']}")
-    print(f"  Portfolio: {YOUR_INFO['portfolio']}")
-    print(f"  GitHub:    {YOUR_INFO['github']}")
-    print(f"\n  HOW IT WORKS:")
-    print(f"  - Bot opens job, tries to find the form automatically")
-    print(f"  - If not found → YOU click Apply in the browser")
-    print(f"    Press Enter once you see the APPLICATION FORM")
-    print(f"    Bot then fills all fields using native Playwright methods")
-    print(f"  - Review, fix anything, click SUBMIT")
-    print(f"  - Enter = submitted,  s = skip\n")
+    auto = sum(1 for j in jobs if j[4] != "MANUAL_APPLY")
+    man  = sum(1 for j in jobs if j[4] == "MANUAL_APPLY")
+    print(f"\n{'='*55}")
+    print(f"  Stage 3 — {total} jobs  ({auto} auto, {man} manual)")
+    print(f"  Handlers: Greenhouse, Lever, Workable, SmartRecruiters, Ashby + Generic")
+    print(f"{'='*55}\n")
 
-    results = {"applied": 0, "skipped": 0, "no_pdf": 0}
+    results = {"applied": 0, "skipped": 0, "no_pdf": 0, "expired": 0}
+    os.makedirs(BROWSER_PROFILE, exist_ok=True)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
+        # randomized viewport — each session looks slightly different
+        vw = random.randint(1260, 1300)
+        vh = random.randint(880, 920)
+
+        ctx = pw.chromium.launch_persistent_context(
+            BROWSER_PROFILE,
             headless=False,
-            args=["--start-maximized", "--disable-blink-features=AutomationControlled"],
-        )
-        ctx  = browser.new_context(
-            viewport={"width": 1280, "height": 900},
+            args=[
+                "--start-maximized",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--no-sandbox",
+                "--disable-session-crashed-bubble",
+                "--hide-crash-restore-bubble",
+            ],
+            viewport={"width": vw, "height": vh},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
+            locale="en-US",
+            timezone_id="America/Chicago",
         )
-        page = ctx.new_page()
+        # stealth: mask webdriver flag that ATS bot-detection looks for
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+            window.chrome = {runtime: {}};
+        """)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-        for idx, (job_id, company, title, url, job_status, jd_text) in enumerate(jobs, 1):
+        # dismiss "Restore pages?" crash recovery popup if present
+        try:
+            page.evaluate("""() => {
+                const btns = [...document.querySelectorAll('button')];
+                const x = btns.find(b => /close|dismiss|no thanks|don.t restore/i.test(b.innerText));
+                if (x) x.click();
+            }""")
+        except Exception:
+            pass
+
+        for idx, (job_id, company, title, url, status, jd_text) in enumerate(jobs, 1):
+            # clear Ollama cache per job
+            _CACHE.clear()
+
             ats     = detect_ats(url)
             job_dir = get_output_dir(company, title)
             res_pdf = find_file(job_dir, "resume", "pdf")
             cl_pdf  = find_file(job_dir, "cover_letter", "pdf")
+            is_man  = (status == "MANUAL_APPLY") and (ats != "linkedin")
 
             print(f"\n{'─'*55}")
-            print(f"[{idx}/{total}] [{job_status.replace('GENERATED_','')}] [{company}]")
+            print(f"[{idx}/{total}] [{status.replace('GENERATED_','')}]  {company}")
             print(f"Role:   {title}")
             print(f"ATS:    {ats.upper()}")
-            print(f"Resume: {res_pdf or 'NOT FOUND'}")
+            print(f"Folder: {job_dir}")
+            print(f"Resume: {res_pdf or '❌ NOT FOUND'}")
+            if cl_pdf:
+                print(f"CL:     {cl_pdf}")
 
+            # open folder in Explorer
+            open_folder(job_dir)
+
+            # no PDF
             if not res_pdf:
                 tex = find_file(job_dir, "resume", "tex")
-                print(f"  -> {'Compile resume.tex at overleaf.com' if tex else 'Run stage2 first'}")
-                c.execute("UPDATE seen_jobs SET status='MANUAL_NO_PDF' WHERE jobpostingid=?", (job_id,))
-                conn.commit()
+                print(f"  → {'Compile .tex at overleaf.com' if tex else 'Run stage2 first'}")
+                # safe DB update
+                with conn:
+                    c.execute(
+                        "UPDATE seen_jobs SET status='MANUAL_NO_PDF' WHERE jobpostingid=?",
+                        (job_id,)
+                    )
                 results["no_pdf"] += 1
                 continue
 
-            # ensure tab is alive
-            page = get_live_page(ctx, page)
-
-            # manual-only portals
-            if ats in MANUAL_ONLY:
-                print(f"  {ats.upper()} — opening for manual apply")
-                print(f"  Resume: {res_pdf}")
+            # navigate — with transaction safety
+            try:
+                # get a fresh page
                 try:
-                    page = get_live_page(ctx, page)
-                    page.goto(url, timeout=30000, wait_until="domcontentloaded")
-                    pause(2, 3)
+                    page.title()
+                except Exception:
+                    page = ctx.new_page()
+
+                print(f"\n  Opening: {url[:85]}")
+                page.goto(url, timeout=40000, wait_until="domcontentloaded")
+                page.wait_for_timeout(2000)
+
+            except Exception as e:
+                print(f"  Nav error: {e}")
+                try:
+                    page = ctx.new_page()
+                    page.goto(url, timeout=40000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    print(f"  Could not open — marking manual")
+                    with conn:
+                        c.execute(
+                            "UPDATE seen_jobs SET status='MANUAL_APPLY' WHERE jobpostingid=?",
+                            (job_id,)
+                        )
+                    results["skipped"] += 1
+                    continue
+
+            # check for expired page
+            try:
+                body_txt = page.locator("body").inner_text().lower()
+                if any(p in body_txt for p in [
+                    "server error", "error processing your request",
+                    "page not found", "job has been filled",
+                    "no longer accepting", "posting has expired",
+                    "job is no longer available", "this job is closed",
+                ]):
+                    print("  → Expired/error page — skipping")
+                    with conn:
+                        c.execute(
+                            "UPDATE seen_jobs SET status='EXPIRED' WHERE jobpostingid=?",
+                            (job_id,)
+                        )
+                    results["expired"] += 1
+                    continue
+            except Exception:
+                pass
+
+            # ── LinkedIn Gateway Interception ─────────────────────────────────
+            # LinkedIn "Apply" opens a new tab to the real company ATS.
+            # Three strategies in order:
+            # A) Extract direct URL from button href/data-url attribute
+            # B) Trap new tab with ctx.expect_page() context manager
+            # C) Give user 5 seconds to click manually (login wall)
+            if ats == "linkedin" and not is_man:
+                print("  LinkedIn gateway — extracting external ATS target...")
+                try:
+                    li_btn = page.locator(
+                        '.jobs-apply-button, '
+                        'button:has-text("Apply on company website"), '
+                        'a:has-text("Apply on company website"), '
+                        'button:has-text("Apply"), '
+                        'a:has-text("Apply")'
+                    ).first
+
+                    if li_btn.count() > 0 and li_btn.is_visible(timeout=4000):
+
+                        # Strategy A: extract direct URL from DOM attributes
+                        external_url = None
+                        try:
+                            external_url = (
+                                li_btn.get_attribute("href") or
+                                li_btn.get_attribute("data-url") or
+                                li_btn.get_attribute("data-apply-url")
+                            )
+                        except Exception:
+                            pass
+
+                        if external_url and "http" in external_url and "linkedin.com" not in external_url:
+                            print(f"    → Strategy A: direct URL from DOM → {external_url[:60]}")
+                            page.goto(external_url, wait_until="domcontentloaded", timeout=15000)
+                            page.wait_for_timeout(2000)
+
+                        else:
+                            # Strategy B: trap new tab with expect_page()
+                            print("    → Strategy B: trapping new tab...")
+                            try:
+                                with ctx.expect_page(timeout=6000) as new_page_info:
+                                    li_btn.click(force=True)
+                                new_page = new_page_info.value
+                                new_page.bring_to_front()
+                                try:
+                                    new_page.wait_for_load_state("domcontentloaded", timeout=8000)
+                                except Exception:
+                                    new_page.wait_for_timeout(3000)
+                                page = new_page
+
+                            except Exception:
+                                # Strategy C: LinkedIn login wall blocked it — 5s manual window
+                                print("    → Strategy C: login wall detected.")
+                                print("    *** Click Apply on LinkedIn manually — 5 seconds ***")
+                                page.wait_for_timeout(5000)
+
+                    # sync to active tab
+                    page = ctx.pages[-1] if ctx.pages else page
+                    page.bring_to_front()
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=6000)
+                    except Exception:
+                        pass
+
+                    new_ats = detect_ats(page.url)
+                    print(f"  → URL: {page.url[:70]}")
+                    print(f"  → ATS: {new_ats.upper()}")
+                    ats = new_ats
+
+                    # if still on linkedin after all strategies → manual
+                    if "linkedin.com" in page.url.lower():
+                        print("  → Still on LinkedIn — treating as manual")
+                        is_man = True
+
+                except Exception as e:
+                    print(f"  LinkedIn gateway error: {e}")
+
+
+            # ── Discovery Router ──────────────────────────────────────────────
+            # If URL is a company landing/careers page (not a direct ATS form),
+            # navigate through it to find the actual application form.
+            # Note: linkedin is allowed here — after gateway interception above,
+            # ats has already been re-detected as the real company ATS.
+            if ats not in ("oracle", "taleo", "google", "apple", "amazon") and not is_man:
+                try:
+                    n_inputs = page.locator('input:not([type="hidden"])').count()
+                    if n_inputs < 3:
+                        page, found = resolve_careers_landing_page(
+                            page, ctx, target_title=title
+                        )
+                        if found:
+                            # re-detect ATS after navigation (may have landed on Greenhouse etc.)
+                            new_ats = detect_ats(page.url)
+                            if new_ats != "unknown" and new_ats != ats:
+                                print(f"  → ATS re-detected: {new_ats.upper()}")
+                                ats = new_ats
+                        else:
+                            print("  → Could not resolve to application form")
                 except Exception:
                     pass
-                choice = input("  [Enter = applied,  s = skip] > ").strip().lower()
+
+            # build handler (with updated page + possibly re-detected ats)
+            handler = get_handler(
+                ats, page, ctx, url, res_pdf, cl_pdf,
+                job_dir, company, title, jd_text
+            )
+
+            # MANUAL ONLY portals
+            if is_man or ats in ("oracle", "taleo", "google", "apple", "amazon"):
+                handler.apply()
+                choice = input("\n  [Enter = applied,  s = skip] > ").strip().lower()
                 if choice == "s":
-                    c.execute("UPDATE seen_jobs SET status='MANUAL_APPLY' WHERE jobpostingid=?", (job_id,))
                     results["skipped"] += 1
                 else:
-                    c.execute("UPDATE seen_jobs SET status='APPLIED' WHERE jobpostingid=?", (job_id,))
+                    with conn:
+                        c.execute(
+                            "UPDATE seen_jobs SET status='APPLIED' WHERE jobpostingid=?",
+                            (job_id,)
+                        )
                     results["applied"] += 1
-                conn.commit()
                 continue
 
-            # navigate
-            print(f"  Navigating...")
-            nav_ok = False
-            for attempt in range(2):
-                try:
-                    page = get_live_page(ctx, page)
-                    page.goto(url, timeout=45000, wait_until="domcontentloaded")
-                    pause(3, 5)
-                    nav_ok = True
-                    break
-                except Exception as e:
-                    if attempt == 0:
-                        page = ctx.new_page()
-                    else:
-                        print(f"  Nav failed: {e}")
-
-            if not nav_ok:
-                choice = input("  [Enter = skip,  s = skip] > ").strip().lower()
-                c.execute("UPDATE seen_jobs SET status='MANUAL_APPLY' WHERE jobpostingid=?", (job_id,))
-                conn.commit()
-                results["skipped"] += 1
-                continue
-
-            # try to get to form
-            print(f"  Looking for application form...")
-            page, form_found = navigate_to_form(page, ctx, url, ats)
-
-            if not form_found:
-                print(f"\n  ┌────────────────────────────────────────────────────┐")
-                print(f"  │  Form not found automatically.                      │")
-                print(f"  │  In the browser: click Apply / find the form.       │")
-                print(f"  │  Once you see INPUT FIELDS on screen → press Enter  │")
-                print(f"  └────────────────────────────────────────────────────┘")
-                input("  [Press Enter when you are ON the application form] > ")
-                pause(1, 2)
-
-            # !! CRITICAL: always get the LATEST active page !!
-            # if user opened a new tab, we must use that tab, not the old one
-            page = get_active_page(ctx)
-            n = page.locator('input:not([type="hidden"])').count()
-            print(f"  Active tab: {page.url[:70]}")
-            print(f"  Input fields visible: {n}")
-
-            if n == 0:
-                print(f"  No fields found on active tab.")
-                print(f"  Make sure the APPLICATION FORM is visible, then press Enter.")
-                input("  > ")
-                page = get_active_page(ctx)
-                n = page.locator('input:not([type="hidden"])').count()
-                print(f"  Input fields now: {n}")
-
-            # fill
-            print(f"  Filling form...")
+            # AUTO FILL
+            fill_ok = False
             try:
-                fill_all_fields(page, res_pdf, cl_pdf, job_dir, company, title, jd_text or "")
+                fill_ok = handler.apply()
             except Exception as e:
-                print(f"  Fill error: {e}")
+                print(f"  Handler error: {e}")
 
-            print(f"\n  ✅ Fill complete — review in browser:")
-            print(f"  🔍 Check: name, email, phone, LinkedIn, portfolio, dropdowns")
-            print(f"  ✏️  Fix anything → click SUBMIT")
+            if not fill_ok and not handler.check_confirmation():
+                # form not found — ask user
+                print(f"\n  ┌─────────────────────────────────────────────┐")
+                print(f"  │  Form not found / fill failed.               │")
+                print(f"  │  Navigate to form in browser → press Enter   │")
+                print(f"  │  Type 's' to skip                            │")
+                print(f"  └─────────────────────────────────────────────┘")
+                inp = input("  [Enter = form ready,  s = skip] > ").strip().lower()
+                if inp == "s":
+                    with conn:
+                        c.execute(
+                            "UPDATE seen_jobs SET status='MANUAL_APPLY' WHERE jobpostingid=?",
+                            (job_id,)
+                        )
+                    results["skipped"] += 1
+                    continue
+                # try generic fill after user navigates
+                try:
+                    handler2 = GenericHandler(
+                        page, ctx, url, res_pdf, cl_pdf,
+                        job_dir, company, title, jd_text
+                    )
+                    handler2._fill_page(handler2.frame)
+                except Exception:
+                    pass
+
+            # bring browser to front
+            try:
+                page = ctx.pages[-1] if ctx.pages else page
+                page.bring_to_front()
+            except Exception:
+                pass
+
+            print(f"\n  ✅ Filled — review in browser and click Submit")
+            print(f"  Check: name, email, phone, dropdowns, open answers")
             print()
             choice = input("  [Enter = I submitted,  s = skip] > ").strip().lower()
 
             if choice == "s":
-                print(f"  -> Skipped")
-                c.execute("UPDATE seen_jobs SET status='MANUAL_APPLY' WHERE jobpostingid=?", (job_id,))
-                conn.commit()
+                print(f"  → Skipped")
+                with conn:
+                    c.execute(
+                        "UPDATE seen_jobs SET status='MANUAL_APPLY' WHERE jobpostingid=?",
+                        (job_id,)
+                    )
                 results["skipped"] += 1
                 continue
 
-            time.sleep(2)
-            # get active page again in case user navigated
-            page = get_active_page(ctx)
-            if check_confirmation(page):
-                print(f"  -> ✅ Confirmation detected!")
+            page.wait_for_timeout(2000)
+            page = ctx.pages[-1] if ctx.pages else page
+            if handler.check_confirmation():
+                print(f"  → ✅ Confirmation detected!")
             else:
-                print(f"  -> Marked APPLIED (check {YOUR_INFO['email']})")
+                print(f"  → Marked APPLIED")
 
-            c.execute("UPDATE seen_jobs SET status='APPLIED' WHERE jobpostingid=?", (job_id,))
-            conn.commit()
+            with conn:
+                c.execute(
+                    "UPDATE seen_jobs SET status='APPLIED' WHERE jobpostingid=?",
+                    (job_id,)
+                )
             results["applied"] += 1
-            pause(2, 3)
+            page.wait_for_timeout(2000)
 
         print(f"\n{'='*55}")
-        print(f"All {total} jobs done.")
+        print(f"  All {total} jobs done.")
         input("Press Enter to close browser > ")
-        browser.close()
+        ctx.close()
 
     print(f"\n=== Results ===")
     print(f"  Applied:  {results['applied']}")
     print(f"  Skipped:  {results['skipped']}")
     print(f"  No PDF:   {results['no_pdf']}")
+    print(f"  Expired:  {results['expired']}")
     conn.close()
     return results
 

@@ -24,7 +24,7 @@ from datetime import datetime
 # ─────────────────────────────────────────────────────────────────────────────
 
 EXCEL_FILE   = "daily_jobs.xlsx"
-DB_PATH      = "job_agent.db"
+DB_PATH = r"C:\JobAgentData\job_agent.db"
 GITHUB_TOKEN = None    # optional — github.com/settings/tokens (no scopes needed)
 
 # Discord webhook — free, takes 5 minutes to set up
