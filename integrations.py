@@ -196,3 +196,52 @@ def sync_resumes_to_azure(local_dir: str, container_name: str):
             blob_client = container_client.get_blob_client(filename)
             with open(os.path.join(local_dir, filename), "rb") as data:
                 blob_client.upload_blob(data, overwrite=True)
+# ── AWS Bedrock ───────────────────────────────────────────────
+def generate_resume_summary_with_bedrock(job_description: str, candidate_skills: list) -> str:
+    """
+    Generate a tailored resume summary using AWS Bedrock as an
+    alternative to local Ollama inference when cloud LLM access is available.
+    
+    Args:
+        job_description: Target job description text
+        candidate_skills: List of candidate's verified skills
+    
+    Returns:
+        Generated summary text tailored to the job
+    """
+    import boto3
+    import json
+    
+    bedrock = boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-east-1"))
+    
+    prompt = f"""Write a 2-sentence resume summary tailored to this job.
+Job: {job_description[:500]}
+Skills: {', '.join(candidate_skills)}"""
+    
+    response = bedrock.invoke_model(
+        modelId="amazon.titan-text-express-v1",
+        body=json.dumps({"inputText": prompt, "textGenerationConfig": {"maxTokenCount": 200}})
+    )
+    
+    return json.loads(response["body"].read())["results"][0]["outputText"]
+
+
+# ── LlamaIndex ────────────────────────────────────────────────
+def build_job_description_index(job_descriptions: list):
+    """
+    Build a LlamaIndex search index over historical job descriptions.
+    Enables semantic search across past applications to find similar
+    roles and reuse successful resume tailoring strategies.
+    
+    Args:
+        job_descriptions: List of job description text strings
+    
+    Returns:
+        Query engine for semantic search over job descriptions
+    """
+    from llama_index.core import VectorStoreIndex, Document
+    
+    docs = [Document(text=jd) for jd in job_descriptions]
+    index = VectorStoreIndex.from_documents(docs)
+    
+    return index.as_query_engine()
